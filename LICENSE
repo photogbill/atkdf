@@ -1,0 +1,10 @@
+Copyright (c) 2026 William (photogbill). All rights reserved.
+
+atkdf is the Analyst Toolkit's direction-finding and geolocation engine. It is
+pure Python and links nothing that constrains its licence — in particular it
+does NOT import atkdaq's GPL Python package; it reads atkdaq's documented wire
+format with its own reader and talks to atkdaq.exe over a pipe.
+
+This placeholder reserves all rights pending the author's choice of an open
+licence. It is deliberately NOT GPL: keeping atkdf free of the GPL is the
+whole reason atkdaq is a separate program.

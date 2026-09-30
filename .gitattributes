@@ -1,0 +1,18 @@
+# atkdf is pure Python with a couple of Windows helper scripts. Line endings
+# are decided here, not per machine (ATK's rule, carried over): cmd.exe parses
+# a .bat by byte offset, so a .bat must be CRLF in the working tree on every
+# machine whatever core.autocrlf says.
+* text=auto
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.txt   text eol=lf
+*.cfg   text eol=lf
+
+*.atkq  binary
+*.npz   binary
+*.sigmf-data binary

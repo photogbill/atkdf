@@ -1,0 +1,18 @@
+[project]
+name = "atkdf"
+version = "0.1.0"
+description = "Analyst Toolkit direction-finding and geolocation engine"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+gpu = ["torch"]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+# Licence: the author's (Bill's) choice — atkdf links nothing that constrains
+# it (unlike atkdaq, which is GPL because of librtlsdr). LICENSE is a
+# placeholder until Bill picks one; nothing here imports a GPL module.

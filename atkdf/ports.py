@@ -1,0 +1,162 @@
+"""The ports: everything the engine needs from the outside world, as small
+protocols. ATK implements them against its real subsystems; tests implement
+fakes; the simulator (`sim.py`) implements all of them. The engine imports
+none of those -- it takes the ports it needs as arguments (dependency
+injection), which is what lets the whole thing run on numpy alone against
+fakes, before the KrakenSDR exists and in every session after.
+
+A Protocol here is a shape, not a base class: anything with the right methods
+satisfies it, so ATK's objects and the fakes need not inherit anything. The
+dataclasses (Fix2D, BurstEvent, Profile, Edge, Reference) ARE shared, because
+they are the vocabulary the two sides speak.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterator, Protocol, runtime_checkable
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# the values that cross the boundary
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Fix2D:
+    """Where the receiver was, and how sure. `course_deg` is direction of
+    travel (GPS course over ground); `sigma_m` the position uncertainty;
+    `fix_age_s` how old the underlying GPS fix is (a stale fix is a wide
+    one, not a wrong one)."""
+
+    lat: float
+    lon: float
+    t_utc: float
+    course_deg: float | None = None
+    speed_mps: float = 0.0
+    alt_m: float | None = None
+    fix_age_s: float = 0.0
+    sigma_m: float = 10.0
+
+
+@dataclass
+class BurstEvent:
+    """A decoder said a known emitter transmitted. `t_utc`/`span_s` locate it
+    in time; `n0`/`n1` (if the decoder is sample-exact) locate it in the
+    stream; `segment` ties those indices to a tuning. Identity is
+    (protocol, system, id) with `slot` and `sync_type` where the protocol has
+    them."""
+
+    protocol: str
+    system: str
+    id: str
+    t_utc: float
+    span_s: float = 0.0
+    n0: int | None = None
+    n1: int | None = None
+    segment: int | None = None
+    slot: int | None = None
+    sync_type: str = ""
+    fc_hz: float = 0.0
+    bw_hz: float = 0.0
+
+
+@dataclass
+class Profile:
+    """A terrain profile between two points: distance and height along it,
+    and which DEM resolution answered (so downstream confidence can carry
+    it)."""
+
+    dist_m: np.ndarray
+    height_m: np.ndarray
+    resolution_m: float = 30.0
+
+
+@dataclass
+class Edge:
+    """A road-graph edge: an id, its endpoints, and a length. `neighbours`
+    are the ids reachable from its far end."""
+
+    id: str
+    a: tuple
+    b: tuple
+    length_m: float = 0.0
+
+
+@dataclass
+class Reference:
+    """A catalogued fixed emitter: an LTE PCI/eNB, a DMR/P25 repeater.
+    `key` matches an emitter key when the reference is heard; `position_sigma_m`
+    and `verified` say how much to trust its coordinates."""
+
+    key: str
+    lat: float
+    lon: float
+    kind: str = ""
+    name: str = ""
+    fc_hz: float = 0.0
+    position_sigma_m: float = 50.0
+    verified: bool = False
+    source: str = ""
+
+
+# ---------------------------------------------------------------------------
+# the protocols
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class FrameSource(Protocol):
+    """Coherent multi-channel frames: atkdaq.exe, a .atkq file, or the
+    simulator. `frames()` yields atkq.Frame; `control()` tunes/cals/etc. (a
+    no-op for a file)."""
+
+    def frames(self) -> Iterator: ...
+    def control(self, cmd: str) -> None: ...
+
+
+@runtime_checkable
+class DecoderEvents(Protocol):
+    """Burst spans with identity: ATK's DSD tap, dmr_sync, or the
+    simulator's side channel."""
+
+    def events(self) -> Iterator[BurstEvent]: ...
+
+
+@runtime_checkable
+class Positioning(Protocol):
+    """Where the receiver is at a UTC instant. ATK's interpolating gps_track,
+    or a simulator track. Everything is matched by time, never by 'latest'."""
+
+    def at(self, t_utc: float) -> Fix2D: ...
+
+
+@runtime_checkable
+class Elevation(Protocol):
+    """Terrain heights. ATK's elevation service, or a flat-earth fake."""
+
+    def profile(self, a: tuple, b: tuple, step_m: float = 30.0) -> Profile: ...
+
+
+@runtime_checkable
+class RoadGraph(Protocol):
+    """The offline road graph a vehicle posterior is constrained to."""
+
+    def nearest_edge(self, lat: float, lon: float) -> "Edge | None": ...
+    def neighbours(self, edge: Edge) -> list: ...
+    def route_time_s(self, a: tuple, b: tuple) -> float: ...
+
+
+@runtime_checkable
+class Catalogue(Protocol):
+    """Reference emitters, looked up by key or by area."""
+
+    def lookup(self, key: str) -> "Reference | None": ...
+    def near(self, lat: float, lon: float, radius_m: float) -> list: ...
+
+
+@runtime_checkable
+class PathLoss(Protocol):
+    """Propagation loss over a profile: atkdsp's ITM, or free space."""
+
+    def loss_db(self, profile: Profile, f_hz: float, h_tx: float, h_rx: float) -> float: ...
