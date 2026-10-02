@@ -12,8 +12,8 @@ from typing import Iterator
 import numpy as np
 
 from .geodesy import bearing_between, distance_between
-from .ports import (BurstEvent, Catalogue, Edge, Elevation, Fix2D, PathLoss,
-                    Positioning, Profile, Reference, RoadGraph)
+from .ports import (BurstEvent, Catalogue, CueSource, Detection, Edge, Elevation,
+                    Fix2D, PathLoss, Positioning, Profile, Reference, RoadGraph)
 
 
 class StaticPositioning:
@@ -161,3 +161,45 @@ class ListEvents:
 
     def events(self) -> Iterator[BurstEvent]:
         yield from self._events
+
+
+class ListCues:
+    """A `CueSource` over a list of Detections, in time order — the scripted
+    cue stream the scheduler is tested against. `replay(scheduler)` drives a
+    scheduler through them, calling `on_cue` at each detection's `t0`,
+    `on_burst_end` at its `t1`, and `tick` in between at `tick_s`, which is
+    how a scripted drive runs without a clock."""
+
+    def __init__(self, detections, tick_s: float = 0.5):
+        self._dets = sorted(detections, key=lambda d: d.t0)
+        self.tick_s = float(tick_s)
+
+    def cues(self) -> Iterator[Detection]:
+        return iter(self._dets)
+
+    def replay(self, scheduler, until: float | None = None) -> list:
+        """Returns the scheduler's decisions, in order."""
+        events = []
+        for d in self._dets:
+            events.append((d.t0, 0, "cue", d))
+            if d.t1 is not None:
+                events.append((d.t1, 1, "end", d))
+        t_end = until if until is not None else (max(t for t, *_ in events) + 10.0
+                                                 if events else 0.0)
+        t = 0.0
+        while t <= t_end + 1e-9:
+            events.append((t, -1, "tick", None))
+            t += self.tick_s
+        events.sort(key=lambda e: (e[0], e[1]))
+        out = []
+        for t, _order, kind, d in events:
+            if kind == "tick":
+                out.extend(scheduler.tick(t))
+            elif kind == "cue":
+                r = scheduler.on_cue(d, t)
+                if r is not None:
+                    out.append(r)
+            else:
+                scheduler.on_burst_end(d, t)
+        return out
+

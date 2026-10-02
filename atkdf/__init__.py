@@ -19,9 +19,9 @@ API_VERSION = 1
 # The moved maths (same names as in ATK's siga)
 from . import bluefile, df_file, dossier, ephemeris, fusion, geodesy, geoloc
 # The engine
-from . import (atkq, calibration, doa, engine, fakes, heading, identity, manifold, motion,
-               ports, posterior, recio, recorder, records, references, registry,
-               roster, sim, tracker)
+from . import (atkq, calibration, doa, engine, exports, fakes, heading, identity, manifold,
+               motion, ports, posterior, recio, recorder, records, references, registry,
+               roster, scheduler, sim, tracker)
 from .dossier import Measurement
 from .engine import Engine, PlatformMode
 from .heading import HeadingFilter
@@ -34,7 +34,8 @@ __all__ = [
     "uca", "ula", "BearingRecord", "Emitter", "EmitterKey", "Passport", "Measurement",
     "Registry", "HeadingFilter",
     "atkq", "calibration", "doa", "manifold", "records", "registry", "recorder",
-    "heading", "identity", "motion", "posterior", "references", "roster", "tracker",
+    "heading", "identity", "motion", "posterior", "references", "roster", "scheduler",
+    "tracker", "exports",
     "ports", "fakes", "sim", "recio", "geodesy",
     "ephemeris", "fusion", "geoloc", "df_file", "dossier", "bluefile",
 ]

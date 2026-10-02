@@ -63,6 +63,50 @@ class BurstEvent:
 
 
 @dataclass
+class Detection:
+    """The LISTENER heard energy (ATK's cued-DF plan, §5.2). A detection is
+    the primary object of cued DF; an identity is an optional field on it,
+    because most RF energy carries none.
+
+    `t0` is when it began; `t1` is None while it is still going. `key` is
+    the emitter key when a decoder supplied one (``dmr:1:473``), else a
+    signature key (``sig:…``, see `scheduler.signature_key`), else empty —
+    the scheduler falls back to the frequency. `grant` marks a trunking
+    grant: a look-ahead cue naming the traffic channel BEFORE the voice
+    starts. `signature` carries what the detector measured about the
+    burst's shape (bw_hz, rise_ms, duration_s, periodicity_s,
+    modulation_hint) for emitters with no identity.
+    """
+
+    t0: float
+    fc_hz: float
+    bw_hz: float = 12_500.0
+    t1: float | None = None
+    level_db: float = 0.0
+    snr_db: float = 0.0
+    key: str = ""
+    protocol: str = ""
+    grant: bool = False
+    signature: dict = field(default_factory=dict)
+    source: str = "listener"
+
+    @property
+    def open(self) -> bool:
+        return self.t1 is None
+
+    def is_open(self, now: float) -> bool:
+        """Still transmitting at `now` (a scripted cue may carry its end
+        time from the start; it is open until then)."""
+        return self.t1 is None or self.t1 > now
+
+    def duration(self, now: float) -> float:
+        """How long it has been going AS OF `now` — never credits a scripted
+        end time that has not happened yet."""
+        end = now if self.t1 is None else min(self.t1, now)
+        return max(0.0, end - self.t0)
+
+
+@dataclass
 class Profile:
     """A terrain profile between two points: distance and height along it,
     and which DEM resolution answered (so downstream confidence can carry
@@ -113,6 +157,15 @@ class FrameSource(Protocol):
 
     def frames(self) -> Iterator: ...
     def control(self, cmd: str) -> None: ...
+
+
+@runtime_checkable
+class CueSource(Protocol):
+    """Detections from the listening receiver (ATK's bladeRF CFAR detector
+    with its decoder taps), or the simulator's scripted cues. The scheduler
+    consumes them; nothing waits for a decode."""
+
+    def cues(self) -> Iterator[Detection]: ...
 
 
 @runtime_checkable

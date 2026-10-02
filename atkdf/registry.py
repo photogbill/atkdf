@@ -122,8 +122,11 @@ class Registry:
 
 
 def load_fleet_map(path) -> dict:
-    """A fleet map CSV `id,name,role,team,protocol,system` -> {key: {...}}.
-    The key is `protocol:system:id`, so an alert can read a name."""
+    """A fleet map CSV `id,name,role,team,protocol,system[,priority,photo]`
+    -> {key: {...}}. The key is `protocol:system:id`, so an alert can read a
+    name. `priority` (an integer; higher sorts first on every map and in
+    the scheduler's queue) and `photo` (a URL or file path for the balloon)
+    are optional columns the live sharing uses (`exports.picture_from`)."""
     import csv
     out = {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -134,7 +137,17 @@ def load_fleet_map(path) -> dict:
             if not rid:
                 continue
             key = str(EmitterKey(proto, system, rid))
-            out[key] = {"name": (row.get("name") or "").strip(),
-                        "role": (row.get("role") or "").strip(),
-                        "team": (row.get("team") or "").strip()}
+            entry = {"name": (row.get("name") or "").strip(),
+                     "role": (row.get("role") or "").strip(),
+                     "team": (row.get("team") or "").strip()}
+            pri = (row.get("priority") or "").strip()
+            if pri:
+                try:
+                    entry["priority"] = int(float(pri))
+                except ValueError:
+                    pass
+            photo = (row.get("photo") or "").strip()
+            if photo:
+                entry["photo"] = photo
+            out[key] = entry
     return out

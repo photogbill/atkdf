@@ -472,3 +472,75 @@ ATK's `RoadGraph`/`Elevation`/`PathLoss` ports and DEM tiles), the **planner**,
 These are Bill-directed once the hardware, the terrain data, and atkdsp's
 pilots are in place; the ports they plug into are already defined in `ports.py`
 and faked in `fakes.py`.
+
+## 12. Asks from the cued-DF plan (ATK `docs/CUED_DF_PLAN.md`, 2026-10-02)
+
+The two-receiver configuration adds the following to this engine; all
+pure Python, all against the simulator first, each a port or a module in
+the existing shape.
+
+1. **`ports.CueSource`** — **built 2026-10-02.** `ports.Detection` is the
+   cue record (`t0`, `t1 | None` while open, `fc_hz`, `bw_hz`, level, snr,
+   optional `key`, `protocol`, `grant`, `signature{…}`), `CueSource.cues()`
+   the iterator, `fakes.ListCues` the scripted source (its `replay()` drives
+   a scheduler through cues, burst ends and ticks without a clock). ATK
+   implements it over the bladeRF's CFAR detector and decoder taps.
+   (`CUED_DF_PLAN.md` §5)
+2. **`scheduler.py`** — **built 2026-10-02**, 22 tests including a scripted
+   relief drive. `Scheduler(config, costs, control)`: `on_cue`,
+   `on_burst_end`, `note_bearing`, `set_listener`, `tick`; `Costs` (atkdaq's
+   built numbers as defaults, T1b to replace them; `phase_cache` a flag
+   T1b opens); `HoldTimes` (per-key median burst length with the ID →
+   signature → frequency → protocol → default chain); keys by `key_for`
+   (`signature_key`, `freq_key`). Decisions: `stay` (in the window — the
+   engine takes it from the ring), `tune`, `preposition` (held until a
+   periodic emitter's next burst), `cal`; every cue not acted on is a
+   `Missed` with a reason (`mode_off`, `not_priority`, `lower_priority`,
+   `gate_failed`). Four parking policies, three cued modes, the gating rule
+   with integration bounded by the burst, revisit guarantees that pre-empt
+   the dwell, the idle-time cal refresh, a cue nobody closes expiring after
+   `OPEN_MAX_S`. Not yet done: wiring to a live `FrameSource.control` and
+   to the engine's bearings in `Engine`; reference dwells as scheduled
+   actions (§6.6) beyond the cal refresh. (§6)
+3. **Energy-clocked spans** in `engine.py`/`identity.py` — a detection's
+   `(t0, t1, fc)` addresses the ring exactly as a decoder burst does; DF
+   everything is the same path run on the array's own window. (§7)
+4. **Provenance tiers** in `calibration.py`/`references.py` — `in_band |
+   out_of_band | cached | cached_previous | uncalibrated` from
+   `cal_state`, passport age and the reference residuals; the tier widens
+   σ through the error model and travels in the passport. (§4.4)
+5. **Bias as a track parameter** — `fusion` solves (position, bias) per
+   window+passport bias group once a track has geometry; agreement across
+   tracks marks a cache entry stale. (§8.3)
+6. **Signature association** — `sig:<hash>` keys from the detection
+   signature for emitters with no ID, between the registry's ID keys and
+   the tracker. (§8.1)
+7. **`boxes.py`** — line-of-bearing/box intersection, then posterior mass
+   inside; a priority contribution, never a discard; inversion; several
+   named boxes. (§9)
+8. **Catalogue roles** in `references.py` — `reference | ignore | target`
+   with the defaults in `CUED_DF_PLAN.md` §10.
+9. **Simulator scenarios** — a two-receiver timing model (listener cue →
+   array span), planted per-burst SNR and PTT lengths, a planted window
+   bias, references in and out of band — so T5 runs without hardware.
+   (§15)
+10. **`exports.py`** — **built 2026-10-02**, 24 tests. Live sharing as
+    pure functions from a `Picture` (a frozen view: `Vehicle`, `Lob`,
+    `Track`, `Box`, `RefMark`) to text: `picture_from(registry, …)` (the
+    fix from `fusion`'s ellipse, a one-bearing track as a wedge, a
+    repeater-only ID as *heard via repeater* with no place, silence from
+    the roster, aged areas from a posterior, the fleet map's `priority`
+    and `photo` — two new optional CSV columns in `registry.load_fleet_map`);
+    `plain_sentence`, `label_for` (the person, else what the emitter is,
+    never a guess); `apply_policy` (`everything | box_only | selected |
+    fixes_only` — the last strips every identity string, callsign and
+    site id included); `fade_alpha`, `ellipse_ring`, `wedge_ring`;
+    `to_kml` (folders, per-placemark fade, `TimeStamp`s, person-first
+    names, the sentence above the rule in the balloon), `network_link_kml`,
+    `to_geojson`, `records_since(log, offset)` for the merge feed, and
+    `to_cot` (stable uids per key, callsign = the person, `stale` from the
+    silence threshold, LOBs as range-and-bearing lines). ATK serves and
+    pushes these from `atk/core/share_server.py` and `atk/core/cot.py`.
+    Not drawn yet: the posterior as a heat image, the coverage footprint.
+    (§12A)
+
