@@ -516,7 +516,7 @@ class ProcessSource:
     """
 
     def __init__(self, args=(), exe=None, on_event: Callable | None = None,
-                 bufsize: int = 4 << 20):
+                 bufsize: int = 4 << 20, popen_kw: dict | None = None):
         path = find_atkdaq(exe)
         if path is None:
             raise FileNotFoundError(
@@ -528,9 +528,18 @@ class ProcessSource:
         self.status: dict = {}
         self.skipped: list = []
         self._lock = threading.Lock()
+        self._wlock = threading.Lock()
+        # A console program started from a GUI process gets a console window
+        # of its own on Windows unless told otherwise — a black box that
+        # appears with every Start. `popen_kw` lets a caller add anything
+        # else (env, cwd) and override this.
+        kw: dict = {}
+        if os.name == "nt":
+            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        kw.update(popen_kw or {})
         self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     bufsize=bufsize)
+                                     bufsize=bufsize, **kw)
         self._err = threading.Thread(target=self._read_stderr, daemon=True)
         self._err.start()
 
@@ -553,11 +562,14 @@ class ProcessSource:
         yield from read_frames(self.proc.stdout, self.skipped)
 
     def control(self, cmd: str) -> None:
-        try:
-            self.proc.stdin.write((str(cmd).strip() + "\n").encode())
-            self.proc.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
+        # Locked: a reader thread sending `tune` and a UI thread sending
+        # `quit` at the same moment must not interleave their bytes.
+        with self._wlock:
+            try:
+                self.proc.stdin.write((str(cmd).strip() + "\n").encode())
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
     def wait_event(self, name: str, timeout: float = 10.0, after: int = 0) -> dict | None:
         end = time.monotonic() + timeout
@@ -571,10 +583,11 @@ class ProcessSource:
 
     def close(self, timeout: float = 5.0) -> int | None:
         self.control("quit")
-        try:
-            self.proc.stdin.close()
-        except OSError:
-            pass
+        with self._wlock:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
         try:
             return self.proc.wait(timeout)
         except subprocess.TimeoutExpired:

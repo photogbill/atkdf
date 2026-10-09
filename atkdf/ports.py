@@ -38,6 +38,13 @@ class Fix2D:
     alt_m: float | None = None
     fix_age_s: float = 0.0
     sigma_m: float = 10.0
+    #: The ARRAY's forward heading (degrees true) when something other than
+    #: the GPS course knows it — a tripod set by compass, a heading aligned
+    #: on a reference, a vehicle's mounting offset applied. When set, the
+    #: engine uses it (with `heading_sigma_deg`) instead of `course_deg`,
+    #: whose sigma is "undefined when stopped".
+    heading_deg: float | None = None
+    heading_sigma_deg: float | None = None
 
 
 @dataclass

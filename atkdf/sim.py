@@ -105,6 +105,19 @@ class Scenario:
     heading_deg: float = 0.0
 
 
+def _payload(h: Header, x) -> bytes:
+    """The payload bytes of the frame `x` encodes to.
+
+    FIXED 2026-10-06: this used to be `encode_frame(h, x)[h.hdr_bytes:]`, but
+    a Header built here has hdr_bytes 0 (it is only filled in when a header
+    is PARSED), so every simulated payload began with the 256 header bytes:
+    each channel was shifted 128 samples into the one before it and channel
+    0 opened with the header read as samples. Every channel moved by the
+    same amount, so bearings survived — which is why nothing failed."""
+    full = atkq.encode_frame(h, x)
+    return full[atkq.FIXED_BYTES + h.n_channels * atkq.CH_STRIDE:]
+
+
 class Simulator:
     """A `Scenario` as a FrameSource (`frames()`, `control()`) plus a matching
     DecoderEvents (`events()`) and Positioning (`positioning`)."""
@@ -261,7 +274,7 @@ class Simulator:
                 x = self._to_adc(self._receiver(src) + self._noise((self.sc.n_ch, n)))
                 h = self._header(k, CalState.CALIBRATING, int(Flag.NOISE_ON) |
                                  (int(Flag.SEGMENT_START) if k == 0 else 0))
-                yield Frame(h, atkq.encode_frame(h, x)[h.hdr_bytes:])
+                yield Frame(h, _payload(h, x))
                 continue
             base_of = {}
             x = np.zeros((self.sc.n_ch, n), dtype=complex)
@@ -276,7 +289,7 @@ class Simulator:
             x = self._to_adc(self._receiver(x) + self._noise((self.sc.n_ch, n)))
             h = self._header(k, CalState.CALIBRATED,
                              int(Flag.SEGMENT_START) if k == 0 else 0)
-            payload = atkq.encode_frame(h, x)[h.hdr_bytes:]
+            payload = _payload(h, x)
             yield Frame(h, payload)
 
     def write(self, path) -> str:

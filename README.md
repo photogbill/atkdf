@@ -7,7 +7,9 @@ simulator that tests all of it against a planted truth. Pure Python
 Frames come from [atkdaq](../atkdaq), a `.atkq` recording, a SigMF clip, or
 the simulator — the same `FrameSource`.
 
-**Status (2026-09-30):** Phase 0 built and green — the `siga` maths moved in,
+**Status (2026-10-06):** live in ATK — the KrakenSDR's frames reach `Engine`
+through ATK's `df_live.py` (RF → Direction Finding), first field test
+2026-10-07. Before that: (2026-09-30) Phase 0 built and green — the `siga` maths moved in,
 the DF core, the simulator spine, and the engine end to end. Nothing here
 needs the KrakenSDR. The plan is `docs/ATKDF_PLAN.md`; ATK's
 `docs/KRAKEN_DF_PLAN.md` is the umbrella.
@@ -34,7 +36,11 @@ atkdf/
                          quality metrics, the 360-point likelihood
   records.py             BearingRecord, Passport, EmitterKey — JSON round-trip
   ports.py fakes.py      the injected protocols, and fakes for tests/sim
-  engine.py              the per-frame loop: calibrate → per-burst DoA → record
+  engine.py              the per-frame loop: calibrate → per-burst DoA → record;
+                         band work calibrated per FFT bin, an energy gate,
+                         last_status / last_result for a live display
+  site.py                a fixed site's position and ARRAY heading; aligning
+                         that heading on a reference (the radio compass)
   sim.py                 the scenario simulator: a FrameSource with a planted
                          truth plus fakes of every port — the test spine
   tests/                 246 tests, numpy only, no hardware, no ATK, no Qt

@@ -80,6 +80,20 @@ class Engine:
     site_id: str = ""
     manifold_id: str = ""
     passport: Passport | None = None
+    #: An energy gate for band work (a decoder burst, or an operator's DF
+    #: target): when the band's power over the floor (`doa.band_snapshots`
+    #: stats) is below this, no bearing is produced — a handheld that is not
+    #: keyed is not a bearing of the noise. None = no gate (the decoder
+    #: already said something transmitted).
+    gate_snr_db: float | None = None
+    #: What the last frame came to, for a live display: state is one of
+    #: unusable | no_target | squelched | low_confidence | bearing | error,
+    #: with the band SNR, per-channel band power and why. Replaced, never
+    #: mutated, so a reader on another thread sees a whole dict.
+    last_status: dict = field(default_factory=dict)
+    #: The DoaResult behind the last bearing (its pseudo-spectrum is what a
+    #: polar display draws).
+    last_result: object | None = None
     _pending: list = field(default_factory=list)
     n_frames: int = 0
     n_records: int = 0
@@ -96,15 +110,36 @@ class Engine:
         if h.has(Flag.SEGMENT_START):
             self._pending.clear()
         if not h.usable_for_df:
+            self.last_status = {"t_utc": h.t_utc, "state": "unusable",
+                                "why": "; ".join(h.why_not_usable()),
+                                "passport": int(h.passport)}
             return []
         self.passport = calibration.passport_of(
             h, geometry_id=self.geometry.id, manifold_id=self.manifold_id,
             site_id=self.site_id)
-        y = self.geometry.element_order(calibration.calibrate(frame))
+        # Two views of the frame, each made only if something needs it. Band
+        # work (a burst, a DF target) calibrates PER FFT BIN inside
+        # band_snapshots — exact, and it skips the whole-band FFT
+        # calibration that costs two thirds of a frame's time at 2.4 MSPS.
+        # The survey path (no band) still uses the whole-band calibration.
+        cache: dict = {}
+
+        def raw():                        # receiver order, uncalibrated
+            if "raw" not in cache:
+                cache["raw"] = frame.iq()
+            return cache["raw"]
+
+        def calibrated():                 # element order, whole-band calibrated
+            if "cal" not in cache:
+                cache["cal"] = self.geometry.element_order(calibration.calibrate(frame))
+            return cache["cal"]
+
         s0 = h.stream_sample0
         s1 = s0 + h.samples_per_ch
         out = []
         used_burst = False
+        self.last_status = {"t_utc": h.t_utc, "state": "no_target",
+                            "passport": int(h.passport)}
         for e in events:
             if e.segment is not None and e.segment != h.segment:
                 continue
@@ -114,13 +149,13 @@ class Engine:
             if hi - lo < 64:
                 continue
             used_burst = True
-            seg = y[:, lo - s0:hi - s0]
-            rec = self._bearing(h, seg, frame, band=channel_band(h, e), event=e,
-                                span=(n0, n1))
+            rec = self._bearing(h, raw()[:, lo - s0:hi - s0], frame,
+                                band=channel_band(h, e), event=e, span=(n0, n1))
             if rec is not None:
                 out.append(rec)
         if not used_burst and self.mode.survey:
-            rec = self._bearing(h, y, frame, band=None, event=None, span=(s0, s1))
+            rec = self._bearing(h, calibrated(), frame, band=None, event=None,
+                                span=(s0, s1))
             if rec is not None:
                 out.append(rec)
         self.n_records += len(out)
@@ -128,9 +163,13 @@ class Engine:
 
     # -- one bearing ---------------------------------------------------------
     def _bearing(self, h, seg, frame, band, event, span) -> BearingRecord | None:
+        """`seg` is RAW receiver-order samples when `band` is given (calibrated
+        per bin here), and calibrated element-order samples when it is not."""
         if seg.shape[1] < 64:
             return None
         f_hz = float(event.fc_hz) if (event and event.fc_hz) else float(h.fc_hz)
+        status = {"t_utc": h.t_utc, "state": "bearing", "passport": int(h.passport),
+                  "fc_hz": f_hz, "bw_hz": (band[1] - band[0]) if band else 0.0}
         if band is not None:
             # an FFT fine enough to put ~16 bins in the channel, so MDL sees a
             # clean rank-1-plus-white-noise spectrum, but never longer than the
@@ -138,7 +177,18 @@ class Engine:
             bw = max(band[1] - band[0], 1.0)
             nfft = int(2 ** round(math.log2(max(64, min(seg.shape[1] // 4,
                                                         16 * h.fs_hz / bw)))))
-            Y, _freqs, neff = _doa.band_snapshots(seg, h.fs_hz, band[0], band[1], nfft=nfft)
+            st: dict = {}
+            Y, _freqs, neff = _doa.band_snapshots(seg, h.fs_hz, band[0], band[1],
+                                                  nfft=nfft, header=h, stats=st)
+            Y = self.geometry.element_order(Y)
+            status["band_snr_db"] = round(st.get("snr_db", 0.0), 1)
+            status["channel_db"] = st.get("channel_db", [])
+            if self.gate_snr_db is not None and st.get("snr_db", 0.0) < self.gate_snr_db:
+                status["state"] = "squelched"
+                status["why"] = (f"band {st.get('snr_db', 0.0):.1f} dB over the floor, "
+                                 f"gate {self.gate_snr_db:.1f} dB")
+                self.last_status = status
+                return None
             cov = _doa.covariance(Y, f_hz, geometry=self.geometry, snapshots=neff,
                                   bw_hz=band[1] - band[0])
             src = cov
@@ -147,15 +197,34 @@ class Engine:
         try:
             res = _doa.estimate(src, self.manifold, f_hz, method=self.mode.estimator,
                                 geometry=self.geometry)
-        except Exception:                                   # noqa: BLE001
+        except Exception as exc:                            # noqa: BLE001
+            status["state"] = "error"
+            status["why"] = f"{type(exc).__name__}: {exc}"
+            self.last_status = status
             return None
+        status["theta_rel_deg"] = float(res.theta_deg)
+        status["confidence"] = float(res.quality.get("confidence", 0.0))
+        self.last_result = res
         if res.quality.get("confidence", 0.0) < self.mode.min_confidence:
+            status["state"] = "low_confidence"
+            status["why"] = (f"confidence {res.quality.get('confidence', 0.0):.2f} "
+                             f"< {self.mode.min_confidence:.2f}")
+            self.last_status = status
             return None
 
         fix = self.positioning.at(h.t_utc) if self.positioning is not None else None
-        heading = fix.course_deg if fix is not None else None
-        heading_sig = self._heading_sigma(fix) if fix is not None else None
+        if fix is not None and getattr(fix, "heading_deg", None) is not None:
+            # the array's own heading (tripod, aligned, or mounting-corrected)
+            heading = float(fix.heading_deg)
+            hs = getattr(fix, "heading_sigma_deg", None)
+            heading_sig = float(hs) if hs is not None else 2.0
+        else:
+            heading = fix.course_deg if fix is not None else None
+            heading_sig = self._heading_sigma(fix) if fix is not None else None
         if heading is None and self.mode.heading_required:
+            status["state"] = "low_confidence"
+            status["why"] = "no heading (mobile mode needs one)"
+            self.last_status = status
             return None
         theta_abs = wrap360(heading + res.theta_deg) if heading is not None else None
         sigma = res.sigma_deg
@@ -170,19 +239,26 @@ class Engine:
             path_tag = self._path_tag(event)
             slot, sync = event.slot, event.sync_type
 
+        quality = dict(res.quality)
+        if "band_snr_db" in status:
+            quality["band_snr_db"] = status["band_snr_db"]
+            quality["channel_db"] = status["channel_db"]
         rec = BearingRecord(
             t_utc=h.t_utc, theta_rel_deg=float(res.theta_deg), sigma_deg=float(sigma),
             estimator=res.estimator, segment=int(h.segment), sample_span=tuple(span),
             fc_hz=f_hz, bw_hz=(band[1] - band[0]) if band else 0.0,
             emitter_key=key, slot=slot, sync_type=sync or "", path_tag=path_tag,
             heading_deg=heading, heading_sigma_deg=heading_sig, theta_abs_deg=theta_abs,
-            quality=dict(res.quality), likelihood=res.likelihood,
+            quality=quality, likelihood=res.likelihood,
             lat=(fix.lat if fix else None), lon=(fix.lon if fix else None),
             fix_age_s=(fix.fix_age_s if fix else None),
             platform_mode=self.mode.name, site_id=self.site_id,
             passport_uid=(self.passport.uid if self.passport else ""),
             manifold=getattr(self.manifold, "kind", "ideal"),
             notes=list(res.caveats))
+        status["theta_abs_deg"] = theta_abs
+        status["sigma_deg"] = float(sigma)
+        self.last_status = status
         return rec
 
     def _heading_sigma(self, fix: Fix2D) -> float:

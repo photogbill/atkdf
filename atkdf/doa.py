@@ -84,11 +84,19 @@ def covariance(x, f_hz: float, geometry: Geometry | None = None,
 
 
 def band_snapshots(x, fs: float, f_lo: float, f_hi: float, nfft: int = 256,
-                   overlap: float = 0.5, window: str = "hann", header=None) -> tuple:
+                   overlap: float = 0.5, window: str = "hann", header=None,
+                   stats: dict | None = None) -> tuple:
     """Frequency-domain snapshots of the band [f_lo, f_hi] (baseband Hz):
     (Y (n, K), freqs, n_eff). Every STFT bin in the band, from every segment,
     is an interchangeable narrowband snapshot for an array this small. With
-    `header`, each bin is calibrated with its own phase slope."""
+    `header`, each bin is calibrated with its own phase slope.
+
+    With `stats` (a dict), it is filled from the same FFT at no extra cost:
+    `band_db` (mean in-band bin power), `floor_db` (the median bin power over
+    the whole digitised band — the noise floor when the band is mostly
+    empty, which a 2.4 MHz capture around one channel is), `snr_db` (their
+    difference) and `channel_db` (in-band power per channel, receiver
+    order: a dead or swapped antenna shows here first)."""
     x = np.asarray(x)
     n, N = x.shape
     nfft = int(nfft)
@@ -105,6 +113,15 @@ def band_snapshots(x, fs: float, f_lo: float, f_hi: float, nfft: int = 256,
         sel = np.zeros(nfft, bool)
         sel[int(np.argmin(np.abs(freqs - 0.5 * (f_lo + f_hi))))] = True
     Xb = X[:, :, sel]
+    if stats is not None:
+        p_all = np.abs(X) ** 2                       # (n, S, nfft)
+        floor = float(np.median(p_all.mean(axis=0))) + 1e-30
+        band = float(p_all[:, :, sel].mean()) + 1e-30
+        stats["band_db"] = 10.0 * math.log10(band)
+        stats["floor_db"] = 10.0 * math.log10(floor)
+        stats["snr_db"] = stats["band_db"] - stats["floor_db"]
+        stats["channel_db"] = [round(10.0 * math.log10(float(v) + 1e-30), 1)
+                               for v in p_all[:, :, sel].mean(axis=(1, 2))]
     if header is not None:
         from .calibration import band_factors
         Xb = Xb * band_factors(header, freqs[sel])[:, None, :]

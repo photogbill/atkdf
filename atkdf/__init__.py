@@ -21,18 +21,19 @@ from . import bluefile, df_file, dossier, ephemeris, fusion, geodesy, geoloc
 # The engine
 from . import (atkq, calibration, doa, engine, exports, fakes, heading, identity, manifold,
                motion, ports, posterior, recio, recorder, records, references, registry,
-               roster, scheduler, sim, tracker)
+               roster, scheduler, sim, site, tracker)
 from .dossier import Measurement
 from .engine import Engine, PlatformMode
 from .heading import HeadingFilter
 from .manifold import Geometry, IdealManifold, MeasuredManifold, uca, ula
 from .records import BearingRecord, Emitter, EmitterKey, Passport
 from .registry import Registry
+from .site import FixedSite
 
 __all__ = [
     "Engine", "PlatformMode", "Geometry", "IdealManifold", "MeasuredManifold",
     "uca", "ula", "BearingRecord", "Emitter", "EmitterKey", "Passport", "Measurement",
-    "Registry", "HeadingFilter",
+    "Registry", "HeadingFilter", "FixedSite", "site",
     "atkq", "calibration", "doa", "manifold", "records", "registry", "recorder",
     "heading", "identity", "motion", "posterior", "references", "roster", "scheduler",
     "tracker", "exports",
