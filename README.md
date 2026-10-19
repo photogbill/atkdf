@@ -8,8 +8,8 @@ Frames come from [atkdaq](../atkdaq), a `.atkq` recording, a SigMF clip, or
 the simulator — the same `FrameSource`.
 
 **Status (2026-10-06):** live in ATK — the KrakenSDR's frames reach `Engine`
-through ATK's `df_live.py` (RF → Direction Finding), first field test
-2026-10-07. Before that: (2026-09-30) Phase 0 built and green — the `siga` maths moved in,
+through ATK's `df_live.py` (RF → Direction Finding); first light on the
+bench 2026-10-06, no field test yet (corrected 2026-10-16). Before that: (2026-09-30) Phase 0 built and green — the `siga` maths moved in,
 the DF core, the simulator spine, and the engine end to end. Nothing here
 needs the KrakenSDR. The plan is `docs/ATKDF_PLAN.md`; ATK's
 `docs/KRAKEN_DF_PLAN.md` is the umbrella.
