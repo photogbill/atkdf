@@ -544,3 +544,152 @@ the existing shape.
     Not drawn yet: the posterior as a heat image, the coverage footprint.
     (§12A)
 
+## 13. Additions 2026-10-28 — nulling, self-calibration, aircraft calibrators (planned)
+
+Bill, 2026-10-28, after asking whether SVD nulling, CLEAN and spectral
+kurtosis belonged on the Kraken, and which radio-astronomy methods could
+join them: *"I think the ones that you recommend, we should add. Even if
+they are only for specific scenarios, just make sure that when they hover
+over that option, that text appears explaining when and how it should be
+used."* **Planned, not built.** Each operator option below is off by
+default and carries the hover text drafted with it; the DF panel itself
+is ATK's (`KRAKEN_DF_PLAN.md`). The detection-side methods are in the
+Diffusion Toolkit's `DETECTION_DESIGN.md` §4.6, their kernels in atkdsp's
+`DSP_EXPANSION_PLAN.md` Part C.
+
+**Already here — do not duplicate.** `doa.py`'s eigendecomposition-based
+estimators (MUSIC, root-MUSIC, Capon/MVDR, ML, FBSS, MDL/AIC counting);
+`calibration.CoherenceMonitor` (drift against a reference while parked);
+SCORE in the Diffusion Toolkit (`cyclo/filters.py`), which nulls an
+interferer that does not share the target's symbol rate.
+
+**Not added: CLEAN for DF.** MUSIC, Capon and ML do not have the wide-beam
+sidelobes CLEAN exists to remove, and `ml_alternating` already fits every
+source jointly. CLEAN belongs to passive radar (`ATKPR_PLAN.md` §6A.4).
+
+**Not added: closure phase.** Considered and dropped. Around three
+antennas each channel's own phase error cancels by construction, so a
+closure phase cannot see a stale calibration — the very error it was meant
+to catch — and for one emitter it is zero whatever the calibration. What
+does carry over from interferometry is self-calibration (§13.2).
+
+### 13.1 Null the strongest, then DF again — `doa.null_and_look`
+
+Estimate the strongest source and project it out: P = I − U_s·U_sᴴ over
+its signal-subspace eigenvector(s), or P = I − a·aᴴ/(aᴴa) from its steering
+vector when its bearing is known (a repeater, a tower, a jammer the
+operator marks). Run the chosen estimator on P·R·P with steering vectors
+P·a(θ). Repeat to at most two nulls. Out: the weak bearings, the nulled
+bearings, and the null depth measured on the data.
+
+- **Limits, said in the result.** Five elements give four nulls at most,
+  one or two useful. Null depth is capped by calibration — a few degrees of
+  phase error holds it near 20–30 dB — so the depth is measured and
+  reported, and the provenance tier (`cached`, `uncalibrated`) warns.
+  Nothing digital recovers a clipped ADC; when atkdaq reports overload the
+  result says so. The null removes everything on that bearing, so a grey
+  "blind" wedge marks where a weak target behind the interferer cannot be
+  seen.
+- **Uses.** A weak handset near a strong repeater or tower; a jammer in
+  band (GNSS_DENIED_AID_PLAN); DF everything.
+- **Accept (sim).** A source 30 dB below a strong one, well separated,
+  invisible in the plain spectrum, found after the null with its error
+  inside the Cramér–Rao spread; negative control — no weak source, no false
+  bearing above the configured rate; a phase-error sweep where measured
+  null depth follows the model.
+
+> **Hover:** "Hides the strongest signal so you can find a weaker one on
+> the same frequency. **Use it when** a strong transmitter (a repeater, a
+> tower, a jammer) swamps the bearing and you think something weaker is
+> also there. **How:** tick the box, or right-click the strong bearing →
+> *Null this*. ATK removes that direction and DFs again; the new bearings
+> appear beside a grey 'blind' wedge where the strong one was — anything
+> right behind it cannot be seen. **Works best** soon after a calibration;
+> the result says how deep the null got."
+
+### 13.2 Self-calibration from emitters of unknown position — `calibration.self_cal`
+
+Radio astronomy's self-calibration, in its array-processing form
+(Weiss–Friedlander blind calibration): from single-source snapshots (high
+`eigen_gap`, MDL = 1) of several emitters at different bearings in the same
+band — or one emitter as the vehicle turns — solve the per-channel phase
+(and gain) errors and the bearings together, by alternating least squares
+against the manifold. No known positions needed. It extends
+`CoherenceMonitor` to a moving platform and to bands with no catalogued
+reference.
+
+- **What it is for.** Checking a cached calibration after a retune or on
+  the move: the solved per-channel phases are compared with the passport's,
+  and the difference feeds the provenance tier (§12 item 4) and the
+  cache-staleness check (§12 item 5). It **offers** a correction; it never
+  applies one silently.
+- **What it does not solve.** Heading — a common rotation of all bearings
+  is still the GPS track's and AUTOCAL's job. A wrong manifold is partly
+  absorbed into the solved phases; the measured manifold limits that.
+- **Limits.** Needs at least two, better three or more, well-separated
+  emitters in the band; coherent multipath breaks the single-source screen
+  (`eigen_gap` and the manifold fit catch it).
+- **Accept (sim).** Planted per-channel phase errors recovered from emitters
+  at unknown bearings to the accuracy the Cramér–Rao bound predicts;
+  negative control — a single emitter at one bearing returns "not
+  solvable", never a fabricated solution.
+
+> **Hover:** "Checks — and can correct — the Kraken's calibration using
+> whatever signals are around, with no known tower needed. **Use it when**
+> you are driving, far from known towers, or have retuned and wonder if
+> the calibration still holds. **How:** tick the box. It needs at least two
+> or three signals from different directions on the band. The DF panel
+> shows how far each antenna has drifted and offers a correction if it is
+> past the limit. **Cannot help** on an empty band."
+
+### 13.3 Aircraft as moving calibrators — `references.aircraft`
+
+Astronomers map antenna beams with satellites; ADS-B (1090 MHz) and, in
+the US, UAT (978 MHz) aircraft broadcast where they are. With the
+vehicle's GPS, every position report is a true azimuth **and elevation**,
+and aircraft cross every bearing and elevation within minutes near a
+flight path. Each burst DF'd against its decoded position measures the
+antenna-side manifold — roof, coupling and the elevation response towers
+near the horizon cannot give — and checks `MeasuredManifold`. Position is
+interpolated to the burst time; low-elevation bursts carry a ground-multipath
+flag.
+
+- **Honest scope.** The manifold changes with frequency: this is exact only
+  near 1 GHz and a partial check at 450 MHz. It also improves DF of ADS-B
+  itself and the Drone Discovery air picture.
+- **Research note, not planned.** GPS L1 satellites are known-position
+  calibrators everywhere, but sit below the noise and need C/A code
+  correlation per satellite; they would calibrate L1 for the GNSS-jammer
+  DF case.
+- **Accept (sim).** Planted manifold errors recovered from a synthetic
+  traffic pattern; a real parked session's residuals reported against the
+  model.
+
+> **Hover:** "Uses aircraft as free calibration targets. They broadcast
+> exactly where they are, so ATK knows the true direction to each one and
+> can measure how your antennas really behave — vehicle roof and all.
+> **Use it when** you are parked where aircraft pass (near an airport is
+> best), after mounting the array on a new vehicle, or before DF work near
+> 1 GHz. **How:** tick the box and leave it running; the panel counts the
+> aircraft used and says when there are enough. **Best** around 1 GHz; at
+> other frequencies it is a partial check."
+
+### 13.4 Spectral-kurtosis screening of snapshots
+
+Before the covariance is formed, frames whose bins `atkdsp_sk` (C1) flags
+as impulsive are dropped — one click or spark can dominate a 5×5
+covariance and pull the bearing. The count dropped goes into the quality
+dict (`n_snapshots_dropped_sk`).
+
+> **Hover:** "Throws away the moments when a click or spark hits, so they
+> do not drag the bearing. **Use it when** bearings jump around near
+> engines, power lines or electrical noise. **How:** tick the box; the
+> result says how many moments were dropped."
+
+### 13.5 Bearings from the correlation radiometer
+
+The Kraken correlation radiometer (`DETECTION_DESIGN.md` §4.6 item 7) finds
+noise-like emitters by their pair cross-correlations; the pair phases are a
+rough bearing. `atkdf` takes it as a wide, low-weight line of bearing from a
+`ports.Detection` with `signature{"xcorr": …}`, never as a fix on its own.
+No separate option — it follows the radiometer's box.

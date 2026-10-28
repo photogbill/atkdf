@@ -98,6 +98,9 @@ class Track:
     trend: str = ""             # tightening | growing | steady | ""
     sentence: str = ""          # plain words, written by `plain_sentence`
     silence_threshold_s: float = 600.0
+    #: the fleet map's optional `affiliation` column (team / civilian / …);
+    #: "" is unknown. Never inferred from the name or the role.
+    affiliation: str = ""
     extra: dict = field(default_factory=dict)
 
     @property
@@ -210,6 +213,7 @@ def picture_from(registry, *, now: float, vehicle: Vehicle | None = None,
                                              getattr(em.last_bearing, "fc_hz", 0.0) or 0.0),
                    name=name, role=role, team=team,
                    priority=int(fm.get("priority", 0) or 0), photo=fm.get("photo", ""),
+                   affiliation=str(fm.get("affiliation", "") or ""),
                    n_bearings=em.n_bearings, first_heard=em.first_heard,
                    last_heard=em.last_heard, protocol=em.protocol,
                    fc_hz=float(getattr(em.last_bearing, "fc_hz", 0.0) or 0.0),
@@ -687,58 +691,131 @@ def records_since(log_path, offset: int = 0, max_bytes: int = 4_000_000) -> tupl
 # Cursor-on-Target
 # ---------------------------------------------------------------------------
 
-#: CoT types used, in one place so a change after testing on a real ATAK is
-#: one edit. Friendly ground: the vehicle; the tracks as "other" ground
-#: units unless the fleet map says friendly; a range-and-bearing line for a
-#: LOB; a shape for a box.
+#: CoT types, in one place so a change after testing on a real ATAK is one
+#: edit (ATK docs/TAK_COT_PLAN.md §2d). ATK's own vehicle is friendly; EVERY
+#: emitter is unknown until the operator says otherwise — a name in the fleet
+#: map is not an affiliation. A range-and-bearing line for a LOB; a shape for
+#: a box.
 COT_TYPES = {
     "vehicle": "a-f-G-E-V-C",
-    "track": "a-f-G-U-C",          # a radio on the roster: friendly
-    "unknown": "a-u-G",            # an emitter nobody has named
+    "unknown": "a-u-G",
     "lob": "u-rb-a",
     "box": "u-d-f",
 }
 
+#: The keywords of `to_cot` that ATK's TAK link relies on (affiliations,
+#: north_ref, station_ce_m, the ellipse). ATK checks this before it sends,
+#: so an older atkdf is refused with a sentence instead of sending the
+#: 2026-10-02 events (wrong ce, no ellipse, a pin for a bearing-only track).
+COT_API = 2
+
+#: The operator's word for what a track is -> its CoT type. ATK never sets
+#: suspect or hostile by itself: those come only from an operator's choice.
+#: ATK's TAK settings may override the types; not the words.
+AFFILIATION_TYPES = {
+    "unknown": "a-u-G",
+    "team": "a-f-G",
+    "civilian": "a-n-G",
+    "suspect": "a-s-G",
+    "hostile": "a-h-G",
+}
+AFFILIATIONS = tuple(AFFILIATION_TYPES)
+
+#: CoT `how`. The vehicle's position is machine GPS; a fix or a line of
+#: bearing is a machine estimate, not GPS — "m-f", machine-fused. ATAK only
+#: requires the attribute to be non-empty (CotEvent.isValid); the first
+#: WinTAK session confirms it displays (TAK_COT_PLAN.md §2e).
+COT_HOW = {"vehicle": "m-g", "fix": "m-f", "lob": "m-f"}
+
+#: ATAK range-and-bearing `northRef`. It sets the LABEL's reference only:
+#: ATAK places the line with the bearing as TRUE whatever this says (checked
+#: in ATAK-CIV's RangeAndBearingImporter). 1 = magnetic is ATAK's default.
+NORTH_REF = {"true": 0, "magnetic": 1, "grid": 2}
+
+#: The station's own position error for CoT (1σ, metres) when nothing better
+#: is known — the vehicle event and every LOB's anchor carry it.
+STATION_CE_M = 10.0
+
+
+def affiliation_of(t: Track, overrides: dict | None = None) -> str:
+    """The operator's word for this track: their override for its key, else
+    the fleet map's `affiliation` column, else "unknown". Never derived from
+    a name or a role."""
+    word = str((overrides or {}).get(t.key) or t.affiliation or "unknown").strip().lower()
+    return word if word in AFFILIATION_TYPES else "unknown"
+
+
+def argb(rgb: str, alpha: float = 1.0) -> tuple:
+    """One colour as ATAK reads it: (`#AARRGGBB`, the signed 32-bit int)."""
+    a = max(0, min(255, int(round(float(alpha) * 255))))
+    v = (a << 24) | int(rgb, 16)
+    return f"#{a:02X}{rgb.upper()}", (v - (1 << 32) if v >= (1 << 31) else v)
+
 
 def to_cot(pic: Picture, *, now: float | None = None, stale_s: float | None = None,
-           lob_stale_s: float | None = None, max_lobs_per_key: int = 3) -> list:
-    """CoT events for a TAK device, one XML string each. UIDs are stable per
-    key, so a radio is one object that moves. `stale` is the roster's
-    silence threshold for a track (the marker fades when ATK greys it) and
-    the fade time for a line."""
+           lob_stale_s: float | None = None, max_lobs_per_key: int = 3,
+           affiliations: dict | None = None, affiliation_types: dict | None = None,
+           north_ref: str = "magnetic", station_ce_m: float = STATION_CE_M,
+           fill_alpha: float = 0.2) -> list:
+    """CoT events for a TAK device, one XML string each (TAK_COT_PLAN.md §2).
+
+    * UIDs are stable per key, so a radio is one object that moves. `stale`
+      is the roster's silence threshold for a track (the marker goes when ATK
+      greys it) and the fade time for a line.
+    * A marker only where ATK has a POSITION. A bearing-only track is its
+      lines of bearing and nothing else — never a pin part-way down a line;
+      a repeater-only ID has nothing to draw. The same rule the KML keeps.
+    * `ce` is the 1σ circular error CoT defines; the honest ellipse at the
+      picture's containment rides on the marker as `<shape><ellipse>` (full
+      axes in metres, angle = the major axis's bearing), coloured by the
+      track's state — how the result was produced. The marker's own frame
+      colour is its affiliation, which is TAK's convention.
+    * `affiliations` is {key: word} from the operator; `affiliation_types`
+      may retune the word -> type table.
+    * LOBs are range-and-bearing lines from the station, the colour fading
+      with age (ATAK reads the alpha or ignores it; either way the line goes
+      at its stale time)."""
     now = pic.t_utc if now is None else now
+    types = {**AFFILIATION_TYPES, **{str(k).lower(): str(v) for k, v in
+                                     dict(affiliation_types or {}).items()
+                                     if str(k).lower() in AFFILIATION_TYPES and v}}
+    nref = NORTH_REF.get(str(north_ref or "").strip().lower(), NORTH_REF["magnetic"])
     events = []
     v = pic.vehicle
     if v is not None:
         events.append(_cot_event(
             uid=f"atk.{pic.site_id}.vehicle", typ=COT_TYPES["vehicle"], t=now,
-            stale=now + 30.0, lat=v.lat, lon=v.lon, ce=10.0,
+            stale=now + 30.0, lat=v.lat, lon=v.lon, ce=station_ce_m, how=COT_HOW["vehicle"],
             detail=(f'<contact callsign="{_x(v.callsign)}"/>'
                     f'<track course="{(v.heading_deg or 0.0):.1f}" speed="{v.speed_mps:.1f}"/>'
                     f'<remarks>{_x(v.status or "")}</remarks>')))
     for t in pic.tracks:
-        if not (t.located or t.last_lob is not None):
+        if not t.located:
             continue
         stale = (t.last_heard + (stale_s if stale_s is not None else t.silence_threshold_s)
                  if t.last_heard else now + 300.0)
-        if t.located:
-            lat, lon, ce = t.lat, t.lon, t.semi_major_m
-        else:
-            mid = geo.direct(t.last_lob.lat, t.last_lob.lon, t.last_lob.bearing_deg,
-                             t.last_lob.range_m / 3)
-            lat, lon, ce = mid[0], mid[1], t.last_lob.range_m
-        typ = COT_TYPES["track"] if t.name else COT_TYPES["unknown"]
+        word = affiliation_of(t, affiliations)
+        typ = types.get(word) or COT_TYPES["unknown"]
+        sigma = t.sigma_m if t.sigma_m > 0 else t.semi_major_m / _k(t.containment)
+        rgb = STATE_RGB.get(t.state, STATE_RGB["unknown"])
+        line = argb(rgb, 1.0)[0]
+        fill = argb(rgb, fill_alpha)[0]
+        pct = int(round(100 * t.containment))
         callsign = t.label + (" — SILENT" if t.state == "silent" else "")
-        remarks = t.sentence or plain_sentence(t, now)
-        colour = "-65536" if t.state == "silent" else ("-16711936" if t.state == "located" else "-256")
+        remarks = ((t.sentence or plain_sentence(t, now))
+                   + f" {pct} % search area {_metres(2 * t.semi_major_m)} × "
+                     f"{_metres(2 * t.semi_minor_m)}.")
         events.append(_cot_event(
             uid=f"atk.{pic.site_id}.{_uid(t.key)}", typ=typ, t=t.last_heard or now,
-            stale=stale, lat=lat, lon=lon, ce=ce,
+            stale=stale, lat=t.lat, lon=t.lon, ce=sigma, how=COT_HOW["fix"],
             detail=(f'<contact callsign="{_x(callsign)}"/>'
                     f'<remarks>{_x(remarks)}</remarks>'
-                    f'<color argb="{colour}"/>'
-                    f'<__atk key="{_x(t.key)}" state="{t.state}" bearings="{t.n_bearings}" '
-                    f'ellipse_m="{2*t.semi_major_m:.0f}" containment="{t.containment}" '
+                    f'<shape><ellipse major="{2 * t.semi_major_m:.1f}" '
+                    f'minor="{2 * t.semi_minor_m:.1f}" angle="{t.orientation_deg % 360:.1f}" '
+                    f'color="{line}" fillColor="{fill}" lineWidth="3"/></shape>'
+                    f'<__atk key="{_x(t.key)}" state="{t.state}" affiliation="{word}" '
+                    f'bearings="{t.n_bearings}" ellipse_m="{2 * t.semi_major_m:.0f}" '
+                    f'containment="{t.containment}" sigma_m="{sigma:.1f}" '
                     f'trend="{_x(t.trend)}" tier="{_x(t.cal_tier)}" motion="{t.motion_state}"/>')))
     # lines: the last few per key, each stale at the fade time
     per_key: dict = {}
@@ -751,26 +828,27 @@ def to_cot(pic: Picture, *, now: float | None = None, stale_s: float | None = No
         lst.append(l)
     for key, lobs in per_key.items():
         for i, l in enumerate(lobs):
+            col = argb(LOB_RGB, fade_alpha(now - l.t_utc, pic.fade_s))[1]
             events.append(_cot_event(
                 uid=f"atk.{pic.site_id}.{_uid(key)}.lob{i}", typ=COT_TYPES["lob"], t=l.t_utc,
                 stale=l.t_utc + (lob_stale_s if lob_stale_s is not None else pic.fade_s),
-                lat=l.lat, lon=l.lon, ce=9999999.0,
+                lat=l.lat, lon=l.lon, ce=station_ce_m, how=COT_HOW["lob"],
                 detail=(f'<range value="{l.range_m:.0f}"/><bearing value="{l.bearing_deg:.1f}"/>'
                         '<inclination value="0"/><rangeUnits value="1"/>'
-                        '<bearingUnits value="0"/><northRef value="1"/>'
+                        f'<bearingUnits value="0"/><northRef value="{nref}"/>'
+                        f'<color value="{col}"/>'
                         f'<contact callsign="{_x(l.label or key)} LOB"/>'
                         f'<remarks>σ {l.sigma_deg:.1f}°</remarks>')))
     return events
 
 
 def _cot_event(*, uid: str, typ: str, t: float, stale: float, lat: float, lon: float,
-               ce: float, detail: str, how: str = "m-g") -> str:
+               ce: float, detail: str, how: str) -> str:
     return (f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<event version="2.0" uid="{_x(uid)}" type="{typ}" time="{_iso(t)}" '
             f'start="{_iso(t)}" stale="{_iso(stale)}" how="{how}">'
             f'<point lat="{lat:.6f}" lon="{lon:.6f}" hae="9999999.0" ce="{ce:.1f}" le="9999999.0"/>'
             f'<detail>{detail}</detail></event>')
-
 
 def _uid(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", key)

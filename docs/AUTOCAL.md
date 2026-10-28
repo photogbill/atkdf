@@ -186,3 +186,8 @@ producer for ports that already exist.
   hand.
 - The excursion scheduler (when to step off-target to a reference band) is a
   `PlatformMode` policy; default to opportunistic-only until measured.
+- Moving and unknown-position references (2026-10-28, planned): aircraft
+  (ADS-B 1090 / UAT 978) as calibrators with true azimuth and elevation, and
+  self-calibration from emitters of unknown position — `ATKDF_PLAN.md`
+  §13.2–13.3. They feed the same sinks as this sequence; nothing here
+  changes.

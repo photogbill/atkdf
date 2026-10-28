@@ -126,7 +126,11 @@ def load_fleet_map(path) -> dict:
     -> {key: {...}}. The key is `protocol:system:id`, so an alert can read a
     name. `priority` (an integer; higher sorts first on every map and in
     the scheduler's queue) and `photo` (a URL or file path for the balloon)
-    are optional columns the live sharing uses (`exports.picture_from`)."""
+    are optional columns the live sharing uses (`exports.picture_from`).
+    `affiliation` (team / civilian / suspect / hostile / unknown) is the
+    optional column the TAK output reads for the marker type; blank is
+    unknown, and an unrecognised word is kept as written and read as
+    unknown (`exports.affiliation_of`)."""
     import csv
     out = {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -149,5 +153,8 @@ def load_fleet_map(path) -> dict:
             photo = (row.get("photo") or "").strip()
             if photo:
                 entry["photo"] = photo
+            aff = (row.get("affiliation") or "").strip().lower()
+            if aff:
+                entry["affiliation"] = aff
             out[key] = entry
     return out

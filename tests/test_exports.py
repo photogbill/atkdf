@@ -303,6 +303,10 @@ def test_fixes_only_strips_every_identity_from_every_format():
 
 # --- CoT -------------------------------------------------------------------
 
+def _cot(pic, now, **kw):
+    return {r.get("uid"): r for r in (ET.fromstring(e) for e in ex.to_cot(pic, now=now, **kw))}
+
+
 def test_cot_events_parse_and_keep_stable_uids():
     pic, now = _picture()
     events = ex.to_cot(pic, now=now)
@@ -319,23 +323,75 @@ def test_cot_events_parse_and_keep_stable_uids():
     for r in roots:
         assert r.get("stale") > r.get("time")
         assert r.find("point").get("lat")
+        assert r.get("how")                               # ATAK refuses an empty how
 
 
 def test_cot_callsign_is_the_person_and_silent_is_loud():
     pic, now = _picture()
-    _by_key(pic)["dmr:1:12"].state = "silent"
-    roots = [ET.fromstring(e) for e in ex.to_cot(pic, now=now)]
-    by_uid = {r.get("uid"): r for r in roots}
-    rod = by_uid["atk.van-1.dmr_1_473"]
-    assert rod.find("detail/contact").get("callsign") == "Rodriguez (Medic 2)"
-    assert rod.get("type") == ex.COT_TYPES["track"]
-    assert float(rod.find("point").get("ce")) > 0
+    _by_key(pic)["dmr:1:473"].state = "silent"
+    rod = _cot(pic, now)["atk.van-1.dmr_1_473"]
+    assert rod.find("detail/contact").get("callsign") == "Rodriguez (Medic 2) — SILENT"
     assert "Search area" in rod.find("detail/remarks").text
-    sil = by_uid["atk.van-1.dmr_1_12"]
-    assert sil.find("detail/contact").get("callsign").endswith("— SILENT")
-    assert sil.find("detail/color").get("argb") == "-65536"
-    unk = by_uid["atk.van-1.track_t7"]
-    assert unk.get("type") == ex.COT_TYPES["unknown"]
+    # the state colour is on the ellipse; the marker's frame is its affiliation
+    assert rod.find("detail/shape/ellipse").get("color") == "#FF" + ex.STATE_RGB["silent"].upper()
+    assert rod.find("detail/color") is None
+
+
+def test_cot_a_located_track_carries_the_honest_ellipse_and_a_1_sigma_ce():
+    pic, now = _picture()
+    t = _by_key(pic)["dmr:1:473"]
+    assert t.located
+    rod = _cot(pic, now)["atk.van-1.dmr_1_473"]
+    ell = rod.find("detail/shape/ellipse")
+    # ATAK reads major/minor as FULL axes and halves them (ShapeDetailHandler)
+    assert abs(float(ell.get("major")) - 2 * t.semi_major_m) < 0.1
+    assert abs(float(ell.get("minor")) - 2 * t.semi_minor_m) < 0.1
+    assert abs(float(ell.get("angle")) - t.orientation_deg % 360) < 0.1
+    assert ell.get("fillColor").startswith("#33")          # 20 % fill
+    # CoT's ce is 1σ, NOT the 90 % semi-axis (2.146× smaller at 90 %)
+    ce = float(rod.find("point").get("ce"))
+    assert abs(ce - t.sigma_m) < 0.1
+    assert ce < t.semi_major_m / 2
+    assert rod.get("how") == ex.COT_HOW["fix"] != "m-g"
+    assert "90 % search area" in rod.find("detail/remarks").text
+    assert rod.find("detail/__atk").get("sigma_m")
+
+
+def test_cot_a_bearing_only_track_is_its_lines_and_never_a_pin():
+    pic, now = _picture()
+    t7 = _by_key(pic)["track:t7"]
+    assert t7.state == "bearing_only" and not t7.located
+    by_uid = _cot(pic, now)
+    assert "atk.van-1.track_t7" not in by_uid               # no pin part-way down a line
+    lobs = [u for u in by_uid if u.startswith("atk.van-1.track_t7.lob")]
+    assert lobs, "the bearing itself still goes"
+
+
+def test_cot_affiliation_is_unknown_until_the_operator_says():
+    pic, now = _picture()
+    rod_t = _by_key(pic)["dmr:1:473"]
+    assert rod_t.name == "Rodriguez"
+    # a name is not an affiliation
+    assert _cot(pic, now)["atk.van-1.dmr_1_473"].get("type") == "a-u-G"
+    # the operator's word decides
+    for word, typ in (("team", "a-f-G"), ("civilian", "a-n-G"), ("suspect", "a-s-G"),
+                      ("hostile", "a-h-G"), ("unknown", "a-u-G"), ("nonsense", "a-u-G")):
+        got = _cot(pic, now, affiliations={"dmr:1:473": word})["atk.van-1.dmr_1_473"]
+        assert got.get("type") == typ, word
+        assert got.find("detail/__atk").get("affiliation") == (
+            word if word in ex.AFFILIATIONS else "unknown")
+    # the fleet map's column is the starting value; the operator still wins
+    rod_t.affiliation = "team"
+    assert _cot(pic, now)["atk.van-1.dmr_1_473"].get("type") == "a-f-G"
+    assert _cot(pic, now, affiliations={"dmr:1:473": "civilian"})[
+        "atk.van-1.dmr_1_473"].get("type") == "a-n-G"
+    # the table can be retuned; an unknown word in the table is ignored
+    got = _cot(pic, now, affiliations={"dmr:1:473": "team"},
+               affiliation_types={"team": "a-f-G-U-C", "bogus": "x"})
+    assert got["atk.van-1.dmr_1_473"].get("type") == "a-f-G-U-C"
+    # no hostile anywhere unless asked for
+    assert not any(r.get("type").startswith(("a-h-", "a-s-"))
+                   for r in _cot(*_picture()).values())
 
 
 def test_cot_lobs_are_range_and_bearing_lines_capped_per_key():
@@ -352,6 +408,47 @@ def test_cot_lobs_are_range_and_bearing_lines_capped_per_key():
     assert r.find("detail/range").get("value") == "5000"
     assert r.find("detail/bearing").get("value") is not None
     assert "LOB" in r.find("detail/contact").get("callsign")
+    # the anchor is the station, whose position is known
+    assert float(r.find("point").get("ce")) == ex.STATION_CE_M
+    assert r.find("detail/color").get("value") is not None
+
+
+def test_cot_lob_north_reference_is_the_label_only_and_selectable():
+    pic, now = _picture()
+    lob = next(r for r in _cot(pic, now).values() if r.get("type") == "u-rb-a")
+    assert lob.find("detail/northRef").get("value") == "1"     # ATAK's default: magnetic
+    lob = next(r for r in _cot(pic, now, north_ref="true").values() if r.get("type") == "u-rb-a")
+    assert lob.find("detail/northRef").get("value") == "0"
+    # the bearing written is the true bearing either way
+    assert lob.find("detail/bearingUnits").get("value") == "0"
+
+
+def test_cot_lob_colour_fades_with_age():
+    pic, now = _picture()
+    pic.lobs = [ex.Lob(now, *RX_A, 10.0, 3.0, key="k", label="new"),
+                ex.Lob(now - pic.fade_s, *RX_A, 20.0, 3.0, key="k2", label="old")]
+    by = {r.find("detail/contact").get("callsign"): r
+          for r in _cot(pic, now).values() if r.get("type") == "u-rb-a"}
+    new = int(by["new LOB"].find("detail/color").get("value")) & 0xFFFFFFFF
+    old = int(by["old LOB"].find("detail/color").get("value")) & 0xFFFFFFFF
+    assert (new >> 24) == 255 and (old >> 24) < 255 // 2
+
+
+def test_argb_is_aarrggbb_and_the_signed_int_atak_reads():
+    assert ex.argb("4c8dff") == ("#FF4C8DFF", -11760129)
+    assert ex.argb("54c98a", 0.2)[0] == "#3354C98A"
+    assert ex.argb("000000", 0.0) == ("#00000000", 0)
+
+
+def test_the_fleet_maps_affiliation_column_is_read(tmp_path):
+    from atkdf.registry import load_fleet_map
+    p = tmp_path / "fleet.csv"
+    p.write_text("id,name,role,team,protocol,system,affiliation\n"
+                 "473,Rodriguez,Medic 2,Alpha,dmr,1,Team\n"
+                 "12,Jones,,,dmr,1,\n", encoding="utf-8")
+    fm = load_fleet_map(p)
+    assert fm["dmr:1:473"]["affiliation"] == "team"
+    assert "affiliation" not in fm["dmr:1:12"]
 
 
 # --- the record feed -------------------------------------------------------
