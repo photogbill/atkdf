@@ -141,6 +141,9 @@ class ListCatalogue:
         return [r for r in self.refs
                 if distance_between(lat, lon, r.lat, r.lon) <= radius_m]
 
+    def at_frequency(self, fc_hz: float, tol_hz: float = 3_125.0):
+        return [r for r in self.refs if r.fc_hz and abs(r.fc_hz - float(fc_hz)) <= tol_hz]
+
 
 class NoRoads:
     def nearest_edge(self, lat, lon):

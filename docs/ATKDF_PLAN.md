@@ -712,3 +712,98 @@ then `doa.iaa`, the kr gate on the phase-mode path, the circulant
 parametrisation in `calibration.self_cal`, robust mixture likelihoods in
 `fusion`, and `timing_source` on the frame header for non-Kraken sources.
 Nothing in §0–§13 above changes.
+
+## 15. Build notes — 2026-10-29: Tier 1 of the P25 DF plan (built)
+
+Bill, 2026-10-29: *"Build Tier 1 if you can."* — items 1–4 of
+`ATK\docs\DF_P25_IMPROVEMENT_PLAN.md`'s "what we can do now" list. Built and
+green: **380 tests** here (343 before + 37 new), and ATK's `test_df_live.py`
+(22, 5 new), `test_gnss_heading.py` (7, new) and 311 Qt-free ATK tests that
+reach this engine. Not built in atkdsp: nothing there was touched (the
+channelizer is being built in parallel; `atkdsp\docs\CHANNELIZER_DF_REQUIREMENTS.md`).
+
+### 15.1 Burst integration — `integrate.py`, `engine.py`
+
+`PlatformMode.integrate` (off by default: the per-frame contract and every
+earlier test are unchanged). Each frame's band-limited, calibrated snapshots
+(every frame by its OWN header) are summed per transmitter into one Y·Yᴴ;
+one record per transmission when it ends — gap (`burst_gap_s`, 0.25 s: a
+0.14 s noise-source cal inside a burst does not split it), length cap
+(`max_integration_s`: static 5 s, mobile 1 s), a turn (`max_heading_change_deg`:
+mobile 5°; integration is in the array frame), a retune, or `Engine.flush()`.
+Keys: emitter key + slot (two TDMA slots never share a covariance), else
+the RF centre on a 100 Hz grid + bandwidth; the segment is in every key.
+While open, `last_status` carries an interim estimate (`interim: True`,
+`integrated_ms`, `n_snapshots`) and no record. Records carry `integration`,
+`integrated_ms`, `integrated_frames`, `n_contributions`, `burst_end`, the
+passports if more than one, band SNR median/max. Measured (sim): a 0.5 s
+burst is one bearing with ≥ 9× one frame's snapshots; at +5 dB in channel
+the burst's CRB is under a third of a frame's.
+
+### 15.2 The path tag by frequency — `bandplan.py`, `identity.path_evidence`
+
+P25 Phase 1's frame sync is the same both ways, so the evidence chain is now:
+sync type (incl. P25 Phase 2 `h-cpm`/`h-dqpsk`, trunking `isp`/`osp`, DMR
+direct-mode names) → catalogue by key → `BandPlan` by frequency (a site
+`IdenTable`, then the region's split: US 800 −45 MHz, 700 +30 MHz, 900
+−39 MHz; EU TETRA 380/390) → catalogue by frequency (`at_frequency`, new on
+`references.Catalogue` and `fakes.ListCatalogue`). Talk-around channels
+(800 MHz 8CALL90/8TAC91–94, pre- and post-rebanding) answer `unknown`, never
+`repeated`. VHF/UHF answer `unknown` with the reason. An unknown region is an
+EMPTY plan (a US rule abroad could fuse a repeater as a handset). The reason
+is written on the bearing (`quality.path_evidence`). Lesson the test taught:
+an `IdenTable`'s raster alone almost never decides — a transmit offset is a
+whole number of channel steps (5 MHz = 400 × 12.5 kHz), so a frequency on the
+inbound grid is on the outbound grid too; the channels a grant names
+(`note_channel`) are what make a site table decisive.
+
+### 15.3 Pilots — `pilots.py`, `_atkdsp.py` (plan §6.5, finally written)
+
+`PilotStage` channelises each target (calibrated at its offset, element
+order, mixed on the ABSOLUTE stream index, FFT low-pass overlap-save with
+history + lookahead, decimated on a fixed grid — chunk-invariant, tested) to
+24 kHz and streams it through atkdsp's `DmrSync` (injected by ATK; found by
+`_atkdsp` otherwise — native, else the twin; nothing duplicated). `pilot_doa`
+is the known-waveform ML bearing: Bartlett on Σ wₖ v̂ₖ v̂ₖᴴ, weighted by
+post-correlation SNR, σ from the CRB ⊕ the manifold prior.
+
+**Two findings the tests forced, both now in the code:**
+
+1. *Partial matches.* Inside a strong 4FSK burst the correlator also reports
+   payload partial matches, and with no protocol given the DMR correlator
+   finds them in P25 (one read 3 errors — "confirmed"). Harmless to the
+   bearing (same signal), dangerous to a LABEL. So `select` keeps the family
+   whose syncs read cleanly (≤ 1 error), `mark_periodic` confirms by timing
+   (true syncs recur at 180 ms / 30 ms; partials do not — this is what still
+   recognises real syncs at low SNR), and the DMR path tag needs two clean
+   reads that agree.
+2. *Pilot vs covariance.* Measured on clean P25 over 1 s: at −3/−6/−9 dB per
+   element the whole-burst covariance was 0.5–1.9° off, the pilot 0.2–6.9°
+   — the pilot uses ~25 ms of sync, the covariance all 1000 ms. So the pilot
+   is OWNERSHIP, not precision: `Engine._choose` keeps the covariance bearing
+   when they agree (`method: pilot-confirmed`), takes the covariance's other
+   solution when it sits on the pilot (`pilot-selected` — with a co-channel
+   signal 3 dB stronger, Bartlett's first answer was the interferer at 201°
+   and the sync picked its solution at 55.6°, truth 60°), and falls back to
+   the pilot bearing only when no covariance solution fits (`pilot`).
+   `quality.method` is what ATK colours bearings by.
+
+### 15.4 The simulator's 4FSK — `sim.fsk4_waveform`, `Emitter.waveform`
+
+`"p25"` (C4FM, the TIA-102 frame sync every 864 symbols / 180 ms LDU),
+`"dmr_ms"` (132-symbol bursts with the MS voice sync, one slot, every 60 ms),
+`"dmr_bs"` (BS voice sync every 30 ms); raised-cosine frequency pulses,
+generated at 48 kHz and resampled, phase-continuous across frames. Checked
+against the correlator: P25 syncs every 4 320 samples at 24 kHz, score 0.97,
+0 errors; DMR labelled MS/BS correctly. Simplifications, said: no NID/LC/
+voice structure, no Phase 2, P25's inverse-sinc shaping omitted (costs SNR in
+the correlator, no bearing).
+
+### 15.5 What is still open from the plan's Tier 1–2
+
+Verified only on the simulator: everything above. Real P25/DMR recordings
+through the pilot path (`dmr_sync_check.bat` in ATK for the kernel; then a
+clip through `reprocess`) are the next check. The channel-grid DF-everything
+path waits on atkdsp's channelizer; `MeasuredManifold` / `ErrorModel` on the
+live path, the kr gate, IAA, CEP on the map and baseline thinning are Tier 2.
+

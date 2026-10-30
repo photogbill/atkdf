@@ -16,7 +16,12 @@ WHAT IT PLANTS, and what the chain must give back:
   * optional manifold error (a perturbed array), so the measured-manifold
     path has something to learn back;
   * the frame flags a real run has: NOISE_ON while calibrating, SYNTHETIC on
-    every frame, SEGMENT_START at a retune.
+    every frame, SEGMENT_START at a retune;
+  * (2026-10-29) a real 4FSK waveform with real sync words when an emitter
+    asks for one (`Emitter.waveform`): P25 Phase 1 C4FM with the frame sync
+    every 180 ms LDU, or DMR with BS- or MS-sourced voice syncs, phase-
+    continuous across frames — so atkdsp's sync correlator, and the pilot-
+    aided bearing built on it, have something true to find.
 
 THE MODEL. For a narrowband emitter at relative bearing theta, element m sees
 a_m(theta) (the manifold), times the emitter's complex symbols. Receiver m
@@ -61,6 +66,12 @@ class Emitter:
     period_s: float = 0.0            # 0 = always on
     duty: float = 1.0
     phase0: float = 0.0              # fraction of a period to offset the schedule
+    #: "" = the band-limited random-symbol stream (as before); "p25" = C4FM at
+    #: 4800 Bd with the TIA-102 frame sync every 864 symbols (one LDU, 180 ms);
+    #: "dmr_ms" = DMR handset bursts (132 symbols, MS voice sync in the middle,
+    #: one slot: every 60 ms); "dmr_bs" = DMR repeater outbound (a burst with
+    #: the BS voice sync every 30 ms). See `fsk4_waveform`.
+    waveform: str = ""
 
     def active(self, t0: float, t1: float) -> bool:
         if self.period_s <= 0:
@@ -105,6 +116,84 @@ class Scenario:
     heading_deg: float = 0.0
 
 
+# ---------------------------------------------------------------------------
+# 4FSK waveforms with real sync words (P25 Phase 1 C4FM, DMR)
+# ---------------------------------------------------------------------------
+
+#: TIA-102.BAAA frame sync and ETSI TS 102 361-1 Table 9.2 voice syncs (the
+#: same 48-bit words atkdsp's dmr_sync correlates against).
+P25_FRAME_SYNC = 0x5575F5FF77FF
+DMR_BS_VOICE = 0x755FD7DF75F7
+DMR_MS_VOICE = 0x7F7D5DD57DFD
+#: dibit -> symbol (both standards): 01 +3, 00 +1, 10 -1, 11 -3
+_DIBIT = {1: 3.0, 0: 1.0, 2: -1.0, 3: -3.0}
+SYMBOL_RATE = 4800.0
+
+
+def sync_symbols(word48: int) -> np.ndarray:
+    """A 48-bit sync word as its 24 symbols, most significant dibit first."""
+    return np.array([_DIBIT[(int(word48) >> (46 - 2 * i)) & 3] for i in range(24)])
+
+
+def _raised_cosine(sps: int, alpha: float = 0.2, span: int = 4) -> np.ndarray:
+    """A raised-cosine pulse, peak 1, over ±span symbols (Nyquist: a constant
+    symbol run sits exactly on its deviation)."""
+    t = np.arange(-span * sps, span * sps + 1) / float(sps)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h = np.sinc(t) * np.cos(np.pi * alpha * t) / (1.0 - (2.0 * alpha * t) ** 2)
+    sing = np.isclose(np.abs(2.0 * alpha * t), 1.0)
+    h[sing] = (np.pi / 4.0) * np.sinc(1.0 / (2.0 * alpha))
+    return h
+
+
+def fsk4_waveform(kind: str, n_out: int, fs_out: float, seed: int = 0,
+                  phase0: float = 0.0) -> np.ndarray:
+    """`n_out` samples at `fs_out` of a continuous 4FSK transmission with real
+    sync words, unit power where keyed. kind: p25 | dmr_ms | dmr_bs.
+
+    Frequency pulses are raised cosine (alpha 0.2) — P25's C4FM Nyquist pulse
+    without its inverse-sinc shaping, DMR's RRC pair approximated by its
+    product; the correlator's reference is RRC, so the mismatch costs a little
+    SNR and no bearing. Generated at 48 kHz and resampled to `fs_out`."""
+    from scipy.signal import resample_poly
+    rng = np.random.default_rng(seed)
+    fs_gen = 48_000.0
+    sps = int(round(fs_gen / SYMBOL_RATE))
+    n_sym = int(math.ceil(n_out / fs_out * SYMBOL_RATE)) + 900
+    sym = rng.choice(np.array([3.0, 1.0, -1.0, -3.0]), size=n_sym)
+    keyed = np.ones(n_sym, dtype=bool)
+    off = int(round(phase0 * 864))
+    if kind == "p25":
+        dev, fs_word, period = 1800.0, sync_symbols(P25_FRAME_SYNC), 864
+        for s0 in range(off % period, n_sym - 24, period):
+            sym[s0:s0 + 24] = fs_word
+    elif kind in ("dmr_ms", "dmr_bs"):
+        dev = 1944.0
+        word = sync_symbols(DMR_MS_VOICE if kind == "dmr_ms" else DMR_BS_VOICE)
+        period = 288 if kind == "dmr_ms" else 144          # 60 ms (one slot) / 30 ms
+        burst = 132
+        keyed[:] = kind == "dmr_bs"
+        for b0 in range(off % period, n_sym - burst, period):
+            sym[b0 + 54:b0 + 78] = word
+            keyed[b0:b0 + burst] = True
+    else:
+        raise ValueError(f"unknown waveform {kind!r} (p25, dmr_ms, dmr_bs)")
+    up = np.zeros(n_sym * sps)
+    up[::sps] = sym / 3.0 * dev
+    f = np.convolve(up, _raised_cosine(sps), mode="same")
+    ph = 2.0 * np.pi * np.cumsum(f) / fs_gen
+    gate = np.repeat(keyed.astype(float), sps)
+    iq = np.exp(1j * ph) * gate
+    ratio = fs_out / fs_gen
+    if abs(ratio - round(ratio)) < 1e-9:
+        out = resample_poly(iq, int(round(ratio)), 1)
+    else:
+        from fractions import Fraction
+        fr = Fraction(ratio).limit_denominator(1000)
+        out = resample_poly(iq, fr.numerator, fr.denominator)
+    return out[:n_out].astype(np.complex64)
+
+
 def _payload(h: Header, x) -> bytes:
     """The payload bytes of the frame `x` encodes to.
 
@@ -144,6 +233,7 @@ class Simulator:
         self.samples_per = int(round(scenario.fs_hz * scenario.frame_ms / 1000.0))
         self.t0 = 1_790_000_000.0
         self._events: list = []
+        self._waves: dict = {}          # emitter index -> continuous 4FSK waveform
         self._build_events()
 
     # -- ports ---------------------------------------------------------------
@@ -180,9 +270,12 @@ class Simulator:
                         sync_type=e.sync_type, fc_hz=self.sc.fc_hz + e.f0_hz, bw_hz=e.bw_hz))
 
     # -- signal --------------------------------------------------------------
-    def _emitter_samples(self, e: Emitter, n: int) -> np.ndarray:
-        """One emitter's contribution at the elements: (n_ch, n) complex."""
+    def _emitter_samples(self, e: Emitter, n: int, k: int | None = None) -> np.ndarray:
+        """One emitter's contribution at the elements: (n_ch, n) complex.
+        `k` (the frame index) places a continuous `waveform` emitter's samples."""
         fs = self.sc.fs_hz
+        if e.waveform and k is not None:
+            return self._waveform_samples(e, n, k)
         t = np.arange(n) / fs
         # a band-limited baseband symbol stream at offset f0
         sps = max(2, int(round(fs / e.bw_hz)))
@@ -198,6 +291,20 @@ class Simulator:
         s = base * np.exp(2j * np.pi * e.f0_hz * t) * math.sqrt(10 ** (e.snr_db / 10))
         # a signal at baseband offset f0 is physically at RF fc+f0, so its
         # steering vector uses that frequency, not the tuner centre
+        a = self.manifold.response(e.bearing_deg, self.sc.fc_hz + e.f0_hz)[:, 0]
+        return np.outer(a, s)
+
+    def _waveform_samples(self, e: Emitter, n: int, k: int) -> np.ndarray:
+        idx = self.sc.emitters.index(e)
+        w = self._waves.get(idx)
+        if w is None:
+            total = self.n_frames * self.samples_per
+            w = fsk4_waveform(e.waveform, total, float(self.sc.fs_hz),
+                              seed=self.sc.seed * 101 + idx, phase0=e.phase0)
+            self._waves[idx] = w
+        s = w[k * self.samples_per:k * self.samples_per + n].astype(np.complex128)
+        t = (k * self.samples_per + np.arange(n)) / float(self.sc.fs_hz)
+        s = s * np.exp(2j * np.pi * e.f0_hz * t) * math.sqrt(10 ** (e.snr_db / 10))
         a = self.manifold.response(e.bearing_deg, self.sc.fc_hz + e.f0_hz)[:, 0]
         return np.outer(a, s)
 
@@ -281,7 +388,7 @@ class Simulator:
             for i, e in enumerate(self.sc.emitters):
                 if not e.active((k * n) / self.sc.fs_hz, ((k + 1) * n) / self.sc.fs_hz):
                     continue
-                xe = self._emitter_samples(e, n)
+                xe = self._emitter_samples(e, n, k)
                 base_of[i] = xe
                 x = x + xe
             for i in base_of:

@@ -140,6 +140,15 @@ class Catalogue:
     def add(self, ref) -> None:
         self._by_key[ref.key] = ref
 
+    def at_frequency(self, fc_hz: float, tol_hz: float = 3_125.0) -> list:
+        """References whose catalogued frequency is `fc_hz` (within half the
+        narrowest LMR raster) — how `identity.path_evidence` recognises a known
+        repeater output, or a repeater input / simplex channel, on a band with
+        no duplex rule."""
+        f = float(fc_hz)
+        return [r for r in self._by_key.values()
+                if r.fc_hz and abs(float(r.fc_hz) - f) <= tol_hz]
+
     def learn(self, key: str, lat: float, lon: float, position_sigma_m: float,
               kind: str = "", fc_hz: float = 0.0) -> None:
         """Record a learned position for a key seen from enough angles."""

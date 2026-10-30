@@ -42,9 +42,21 @@ atkdf/
   site.py                a fixed site's position and ARRAY heading; aligning
                          that heading on a reference (the radio compass)
   sim.py                 the scenario simulator: a FrameSource with a planted
-                         truth plus fakes of every port — the test spine
-  tests/                 246 tests, numpy only, no hardware, no ATK, no Qt
+                         truth plus fakes of every port — the test spine; since
+                         2026-10-29 also real 4FSK (P25 C4FM, DMR) with real syncs
+  integrate.py           burst integration: one bearing per transmission, the
+                         whole of it (PlatformMode.integrate)
+  bandplan.py            the path tag by frequency: site IDEN tables, US/EU duplex
+                         rules, talk-around — P25 has no BS/MS sync word
+  pilots.py _atkdsp.py   sync-aided DF: atkdsp's DMR/P25 sync correlator says which
+                         signal is the target; the covariance gives the precision
+  tests/                 380 tests, numpy only, no hardware, no ATK, no Qt (the
+                         pilot tests use atkdsp's twin when it is beside this repo)
 ```
+
+**2026-10-29 (v0.2.0):** Tier 1 of ATK's `docs/DF_P25_IMPROVEMENT_PLAN.md` —
+burst integration, the P25 path tag, pilot-aided bearings. Build notes and the
+measurements behind the design are `docs/ATKDF_PLAN.md` §15.
 
 ## Testing
 
