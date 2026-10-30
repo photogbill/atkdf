@@ -110,6 +110,10 @@ def _wrap180(a: float) -> float:
 #: how far apart the pilot and covariance bearings may be, in combined sigmas,
 #: before the record says so
 DISAGREE_SIGMAS = 3.0
+#: once a sync word has opened the squelch, it stays open this long past the
+#: last sync (two P25 LDUs; DMR syncs every 30–60 ms) — the frames BETWEEN
+#: syncs are the same transmission and their snapshots count
+SYNC_HOLD_S = 0.4
 
 
 def _sync_opens_squelch(hits) -> bool:
@@ -434,12 +438,17 @@ class Engine:
         bkey = _integrate.burst_key(event, h.segment, f_hz, bw)
         hits = self._pilot_feed(h, seg, band, event, lo, skey=bkey)
         out = []
+        t_lo, t_hi = self._t_of(lo), self._t_of(hi)
         sync_open = _sync_opens_squelch(hits)
-        if sync_open and self.gate_snr_db is not None \
-                and st.get("snr_db", 0.0) < self.gate_snr_db:
-            status["squelch"] = "opened by the sync word"
-        if self.gate_snr_db is not None and st.get("snr_db", 0.0) < self.gate_snr_db \
-                and not sync_open:
+        prev = self._integ.open.get(bkey)
+        held = (prev is not None and prev.last_sync_t is not None
+                and t_lo - prev.last_sync_t <= SYNC_HOLD_S
+                and (lo - prev.n1) / float(h.fs_hz) <= self._integ.gap_s)
+        below = self.gate_snr_db is not None and st.get("snr_db", 0.0) < self.gate_snr_db
+        if below and (sync_open or held):
+            status["squelch"] = ("opened by the sync word" if sync_open
+                                 else "held open since the last sync word")
+        if below and not (sync_open or held):
             b = self._integ.open.get(bkey)
             if b is not None and hits:
                 b.pilot_hits.extend(hits)
@@ -448,7 +457,6 @@ class Engine:
                              f"gate {self.gate_snr_db:.1f} dB")
             self.last_status = status
             return out
-        t_lo, t_hi = self._t_of(lo), self._t_of(hi)
         _fix, heading, _hs = self._heading_at(0.5 * (t_lo + t_hi))
         burst, finished = self._integ.contribute(
             bkey, event=event, f_hz=f_hz, bw_hz=bw, segment=h.segment, Y=Y, neff=neff,
@@ -458,6 +466,8 @@ class Engine:
         if finished:
             out += self._finish_bursts(finished)
         burst.pilot_hits.extend(hits)
+        if sync_open:
+            burst.last_sync_t = t_hi
         # the interim needle: everything integrated so far, no record
         try:
             cov = burst.covariance(self.geometry)

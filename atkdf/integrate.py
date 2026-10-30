@@ -98,6 +98,9 @@ class Burst:
     channel_db: list | None = None
     pilot_hits: list = field(default_factory=list)
     end_reason: str = ""
+    #: UTC of the last frame whose sync word opened the squelch (`engine`
+    #: holds the squelch open for SYNC_HOLD_S after it, like a receiver)
+    last_sync_t: float | None = None
     _last_frame: int = -1
 
     def __post_init__(self):

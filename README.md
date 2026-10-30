@@ -50,7 +50,7 @@ atkdf/
                          rules, talk-around — P25 has no BS/MS sync word
   pilots.py _atkdsp.py   sync-aided DF: atkdsp's DMR/P25 sync correlator says which
                          signal is the target; the covariance gives the precision
-  tests/                 380 tests, numpy only, no hardware, no ATK, no Qt (the
+  tests/                 381 tests, numpy only, no hardware, no ATK, no Qt (the
                          pilot tests use atkdsp's twin when it is beside this repo)
 ```
 

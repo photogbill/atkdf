@@ -717,7 +717,7 @@ Nothing in §0–§13 above changes.
 
 Bill, 2026-10-29: *"Build Tier 1 if you can."* — items 1–4 of
 `ATK\docs\DF_P25_IMPROVEMENT_PLAN.md`'s "what we can do now" list. Built and
-green: **380 tests** here (343 before + 37 new), and ATK's `test_df_live.py`
+green: **381 tests** here (343 before + 38 new), and ATK's `test_df_live.py`
 (22, 5 new), `test_gnss_heading.py` (7, new) and 311 Qt-free ATK tests that
 reach this engine. Not built in atkdsp: nothing there was touched (the
 channelizer is being built in parallel; `atkdsp\docs\CHANNELIZER_DF_REQUIREMENTS.md`).
@@ -787,6 +787,15 @@ post-correlation SNR, σ from the CRB ⊕ the manifold prior.
    and the sync picked its solution at 55.6°, truth 60°), and falls back to
    the pilot bearing only when no covariance solution fits (`pilot`).
    `quality.method` is what ATK colours bearings by.
+
+3. *The sync squelch.* An energy gate (ATK's 6 dB squelch) threw away a
+   0 dB-per-element handset before the sync word was consulted — exactly
+   where the pilot matters. Now a frame whose sync reads cleanly (or
+   confirmed) opens the squelch, and it is HELD open `SYNC_HOLD_S` (0.4 s, two
+   LDUs) past the last sync, as a P25 receiver holds it: the frames between
+   syncs are the same transmission. Measured: energy gate alone, no bearing;
+   with the sync squelch, one bearing within 3° over ≥ 800 ms of the 1 s
+   transmission (450 ms before the hold). Payload partials do not open it.
 
 ### 15.4 The simulator's 4FSK — `sim.fsk4_waveform`, `Emitter.waveform`
 

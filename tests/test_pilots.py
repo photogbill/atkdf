@@ -229,4 +229,7 @@ def test_the_sync_word_opens_the_squelch_on_a_weak_handset():
     assert len(recs) == 1
     assert abs(err(recs[0].theta_rel_deg, 145.0)) < 3.0
     assert recs[0].quality["method"].startswith("pilot")
+    # held open between syncs: (nearly) the whole 1 s transmission counts,
+    # not only the frames a sync word happened to fall in
+    assert recs[0].quality["integrated_ms"] >= 800.0
 
