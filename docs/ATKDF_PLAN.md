@@ -856,3 +856,130 @@ sub-0.1° residual, GPSDO timing tier with holdover.
 The rule that governs all of it: **several USRPs are one array only when
 LO-shared on one platform** (T4); a cabled 10 MHz/PPS alone (T3) does not make
 one array, and coherent combining between vehicles is not a feature.
+
+## 17. Build notes — 2026-10-30: the phased-array option, steps 1–5 (built)
+
+Bill chose the X310 + TwinRX recommendation and said to build in the order of
+§11.4.10. Steps 1–5 (no hardware) are done, on the simulator; the UHD
+`multi_usrp` `FrameSource`, DIFI import and measured tables are step 6 (the
+day hardware exists). Everything is additive: the Kraken path is unchanged,
+the full suite grew from 372 to 470 passing (9 skipped). New modules:
+`arrayprofile`, `architectures`, `caltables`, `health`, `timing`, `doa2d`;
+`manifold`, `doa`, `sim`, `ports`, `engine` extended.
+
+### 17.1 3-D geometry, element patterns, field of view (`manifold.py`)
+
+`Geometry.positions` stays (n, 2) so every azimuth path reads what it always
+read; height is `z`, and `positions3` / `electrical3` give (n, 3). Added:
+per-element `phase_centre_m` (fitted and removed before a measured table is
+stored — the Lund enhanced-EADF form, §17.4), per-element `amplitude`, an
+`ElementPattern` (omni or cardioid) with per-element `boresight_deg`,
+`fov_az_deg` / `fov_el_deg`, `groups` (mast faces), `grid` (URA shift axes),
+`hemisphere`, and `subset(keep)` for dropping a dead element. Presets: `uca`
+(now with `centre=True`), `ula`, `ura` (horizontal or vertical), `l_array`,
+`multi_face`. `IdealManifold` carries the pattern and amplitudes; its EADF is
+the closed Bessel form for a plain array and a numeric FFT fit when an element
+pattern is present. `BeamspaceManifold` (A_b = Wᴴa) is the hybrid/switched
+channel manifold; every estimator, root-MUSIC included, runs on it.
+
+In `doa.estimate`: the search is restricted to the field of view, the
+likelihood is flat at the element's back-lobe level outside it (no confident
+ghost behind a panel), the model sigma grows as 1/cos of the scan angle off a
+flat panel's boresight (`scan_factor`), and a bearing near or past the FOV
+edge says so in its caveats.
+
+**Forward–backward averaging fix (found building this).** FB pairs each
+element with its POINT reflection. `Geometry.reflection_permutation()` now
+gives that pairing and `forward_backward(R, perm)` uses it; the old code used
+index reversal, which is right for a ULA or a row-by-row URA but WRONG for an
+even circle (it mixed in a ghost array). It never ran on the Kraken's odd
+5-element ring — FB is off there — so no Kraken result changed, but an
+8-element ring would have been wrong. A measured manifold turns FB off (the
+real array is not its own mirror image); the engine's `_fb()` enforces that.
+
+### 17.2 Array profiles (`arrayprofile.py`, schema v2)
+
+One JSON per array (§11.4.1). First-class fields `architecture`
+{digital | switched | analog | hybrid}, `lo_sharing`, `rx_cal_persistence`,
+`timing.tier`, `rf_chains`, `switching`, `subarrays`, `steering`, two
+`calibration` tables, `cable_class`. `validate()` enforces the rules the
+literature made (independent LOs ⇒ per-retune; T4 is a shared LO; a digital
+array has one channel per element; a switched schedule must visit every
+element; analog halves / hybrid subarrays must not overlap). `capabilities()`
+and `summary()` say what each array can and cannot do, for the DF tab.
+`from_legacy_cfg()` maps the Kraken's flat settings onto a profile. Eight
+presets ship, written to `config\df_arrays\` (ATK side); `kraken5_uca` is the
+Kraken exactly as it was.
+
+### 17.3 Architecture dispatcher (`architectures.py`) and the simulator
+
+`ArrayDF(profile).estimate(...)` dispatches by architecture, all returning a
+`doa.DoaResult`:
+- **digital** → `doa.estimate` unchanged (or `doa2d`, or face hand-off for an
+  independent-face mast);
+- **switched** → each element measured against the reference element so
+  receiver offsets cancel, then matched to the manifold (≈ single-source);
+- **analog** → beam-scan (match the measured per-beam power vector to the
+  stored beam manifold, quadratic peak fit) and phase-comparison monopulse
+  (slope and offset measured per frequency by `fit_monopulse`, because no
+  beamformer has a channel-match spec and no paper gives a comms-waveform
+  slope);
+- **hybrid** → fold the quantised, calibrated weights into A_b = Wᴴa, run the
+  digital estimators, resolve subarray grating-lobe ambiguity by re-steering
+  to the candidates.
+
+`sim.SteerableArraySim`, `sim.SwitchedArraySim`, `sim.ReceiverBank` and
+`sim.element_snapshots` model the documented imperfections: 2.8125°/0.5 dB
+weight quantisation, unmatched channels, random LO phase per device per
+retune with 180° flips, and a burst that ends mid-sweep. Simulated accuracy
+(sanity only, not a hardware claim): switched ≈ at the model floor at ≥ 10 dB;
+beam-scan ⅓–½ a beamwidth at 15 dB; monopulse < 0.5° tracked; hybrid resolves
+its grating lobes.
+
+### 17.4 Two calibration tables, persistence, trigger, health (`caltables.py`, `health.py`)
+
+`CalStore` keeps receiver tables keyed by LO frequency with the per-hardware
+`rx_cal_persistence` policy: `across_power_cycles` (TwinRX/NI-2955) reload
+from disk and are reused; `per_power_cycle` (N3xx) only within a session;
+`per_retune` (Kraken, independent LOs) every retune. The recalibration
+trigger is the on-air `CoherenceMonitor` bound (a parked reference's steering
+vector moved), not a timer — no drift rate exists to schedule on — plus a PTFE
+cable thermal warning. The antenna table is `MeasuredManifold` with a new
+`mode="residual"`: phase centres removed (`fit_phase_centres`) so one table
+measured at 851 MHz holds < 0.5° across 769–851 MHz in simulation (how far in
+frequency that really holds is unmeasured — a step-6 campaign line).
+`health.ChannelHealth` finds dead / noisy / wandering channels from the
+covariance (Sun et al.'s row-sum test, flagged PRC per the provenance rule);
+the engine's optional `health=` drops a bad element, rebuilds the manifold and
+raises the sigma.
+
+### 17.5 Timing tiers (`timing.py`) and 2-D DoA (`doa2d.py`)
+
+`TimingState` is the tier (T0–T5), a lock/holdover/free state machine, and
+`sigma_ns()` (holdover drift: ≈ 1.9 ns/s X3x0 OCXO measured, B210/N3xx
+flagged). `allowed_payloads` is the network policy — bearings always,
+channelised I/Q only when cued and both sites can time-tag, raw never — and
+`tdoa_range_sigma_m` is the P25 planning number (c/4B ≈ 6 km/snapshot).
+`BearingRecord` now carries `timing_tier` and `t_utc_sigma_ns`, stamped by the
+engine; old logs read as T0. `doa2d` adds azimuth+elevation: `music2d`
+(coarse-to-fine, any geometry incl. a measured panel) and `esprit2d`
+(auto-paired, URA, ideal). It states which case it is in — a vertical panel
+measures elevation, a horizontal planar array is up/down ambiguous, a flat
+ring refuses elevation and pins it to 0°.
+
+### 17.6 ATK wiring
+
+`df_live` gained `array_profile` in its settings: "" keeps the flat Kraken
+settings, a named profile supplies geometry, manifold, estimator policy and
+timing. `ensure_array_presets()` drops the presets into `config\df_arrays`;
+`profile_from()` loads one and falls back to the Kraken on any error. The
+contract (an Engine built from a profile direction-finds and tags its tier) is
+covered by `atkdf/tests/test_profile_engine.py`; the ATK-side wiring by
+`ATK/tests/test_df_array_profiles.py`.
+
+### 17.7 Not built this session
+
+The SigMF `spatial` recording reader/writer (§11.4.6 wire formats) is still
+to do, with the UHD `multi_usrp` `FrameSource`, DIFI import and the measured
+tables, in step 6. No hardware has been touched; every number above is
+simulation.

@@ -13,7 +13,7 @@ ATK imports it by a path that would create a GPL combined work with atkdaq.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 API_VERSION = 1
 
 # The moved maths (same names as in ATK's siga)
@@ -26,18 +26,30 @@ from . import (atkq, calibration, doa, engine, exports, fakes, heading, identity
 # pilots (pilots imports atkdsp only when a PilotStage is built without an
 # injected correlator — importing it here costs nothing)
 from . import bandplan, integrate, pilots
+# 2026-10-30: the phased-array option (plan §11.4) — array profiles (schema
+# v2), the four-architecture dispatcher, the two-table calibration store with
+# its persistence policy, channel health, timing tiers, and 2-D DoA. All are
+# configuration and estimators; no new hardware dependency.
+from . import architectures, arrayprofile, caltables, doa2d, health, timing
 from . import channel_grid
 from .dossier import Measurement
 from .engine import Engine, PlatformMode
 from .heading import HeadingFilter
-from .manifold import Geometry, IdealManifold, MeasuredManifold, uca, ula
+from .arrayprofile import ArrayProfile
+from .architectures import ArrayDF
+from .manifold import (BeamspaceManifold, Geometry, IdealManifold, MeasuredManifold,
+                       PerturbedManifold, ElementPattern, uca, ula, ura, l_array, multi_face)
 from .records import BearingRecord, Emitter, EmitterKey, Passport
 from .registry import Registry
 from .site import FixedSite
 
 __all__ = [
     "Engine", "PlatformMode", "Geometry", "IdealManifold", "MeasuredManifold",
-    "uca", "ula", "BearingRecord", "Emitter", "EmitterKey", "Passport", "Measurement",
+    "PerturbedManifold", "BeamspaceManifold", "ElementPattern",
+    "uca", "ula", "ura", "l_array", "multi_face",
+    "ArrayProfile", "ArrayDF",
+    "architectures", "arrayprofile", "caltables", "channel_grid", "doa2d", "health", "timing",
+    "BearingRecord", "Emitter", "EmitterKey", "Passport", "Measurement",
     "Registry", "HeadingFilter", "FixedSite", "site",
     "atkq", "calibration", "doa", "manifold", "records", "registry", "recorder",
     "heading", "identity", "motion", "posterior", "references", "roster", "scheduler",

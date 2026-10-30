@@ -167,6 +167,25 @@ class FrameSource(Protocol):
 
 
 @runtime_checkable
+class BeamSteerer(Protocol):
+    """An analog or hybrid array's control and its combined outputs (plan
+    §11.4.2): `apply(W)` sets the phase shifters / attenuators to the
+    (n_elements, n_channels) weights asked for and returns the weights
+    ACTUALLY applied (quantised, with their calibration) — the estimator folds
+    those, not the request, into the manifold (lit2 §1.7). `capture(n)`
+    returns (n_channels, n) complex samples of the combined outputs taken
+    after the beam has settled. `settle_s` is the switch time; `fs_hz` the
+    output sample rate. The simulator's `SteerableArraySim` is one; a real
+    ADAR1000 / Phaser driver in ATK would be another."""
+
+    settle_s: float
+    fs_hz: float
+
+    def apply(self, weights) -> np.ndarray: ...
+    def capture(self, n: int) -> np.ndarray: ...
+
+
+@runtime_checkable
 class CueSource(Protocol):
     """Detections from the listening receiver (ATK's bladeRF CFAR detector
     with its decoder taps), or the simulator's scripted cues. The scheduler

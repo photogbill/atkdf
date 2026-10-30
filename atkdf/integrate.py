@@ -151,12 +151,14 @@ class Burst:
         if self.cols <= 0:
             raise ValueError("an empty burst has no covariance")
         R = self.S / self.cols
-        use_fb = bool(fb) if fb is not None else bool(
-            geometry is not None and geometry.centrosymmetric)
+        R_raw = R
+        perm = geometry.reflection_permutation() if geometry is not None else None
+        use_fb = bool(fb) if fb is not None else perm is not None
         if use_fb:
-            R = _doa.forward_backward(R)
+            R = _doa.forward_backward(R, perm)
         return _doa.Covariance(R=R, snapshots=int(self.neff), f_hz=float(self.f_hz),
-                               bw_hz=float(self.bw_hz), fb=use_fb)
+                               bw_hz=float(self.bw_hz), fb=use_fb,
+                               R_raw=(R_raw if use_fb else None))
 
     def quality(self) -> dict:
         """What the record carries about the integration itself."""

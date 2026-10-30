@@ -158,6 +158,11 @@ class BearingRecord:
     passport_uid: str = ""
     manifold: str = "ideal"
     notes: list = field(default_factory=list)
+    #: The site's timing tier (T0 … T5, plan §11.4.6) and its 1-σ UTC error
+    #: when the bearing was taken: what decides whether this bearing's
+    #: timestamp may pair with another site's for TDOA. Old logs read as T0.
+    timing_tier: str = "T0"
+    t_utc_sigma_ns: float | None = None
 
     @property
     def key(self) -> EmitterKey | None:

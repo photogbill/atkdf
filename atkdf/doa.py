@@ -51,19 +51,37 @@ class Covariance:
     f_hz: float
     bw_hz: float = 0.0
     fb: bool = False
+    #: the covariance BEFORE forward-backward averaging. Channel-health
+    #: (`health.ChannelHealth`) must read this, never `R`: FB mixes each
+    #: element with its mirror, so a dead element inherits half its mirror's
+    #: power in `R` and no longer looks dead. None when FB was not applied
+    #: (then `R` is already the raw matrix).
+    R_raw: np.ndarray | None = None
 
     @property
     def n(self) -> int:
         return int(self.R.shape[0])
+
+    @property
+    def raw(self) -> np.ndarray:
+        return self.R if self.R_raw is None else self.R_raw
 
 
 def exchange(n: int) -> np.ndarray:
     return np.eye(n)[::-1]
 
 
-def forward_backward(R: np.ndarray) -> np.ndarray:
-    J = exchange(R.shape[0])
-    return 0.5 * (R + J @ R.conj() @ J)
+def forward_backward(R: np.ndarray, perm=None) -> np.ndarray:
+    """½(R + J R* Jᵀ) with J the array's point-reflection permutation
+    (`Geometry.reflection_permutation`); index reversal when none is given,
+    which is right for a ULA or a row-by-row URA and WRONG for a circle."""
+    if perm is None:
+        J = exchange(R.shape[0])
+    else:
+        n = R.shape[0]
+        J = np.zeros((n, n))
+        J[np.arange(n), np.asarray(perm, dtype=int)] = 1.0
+    return 0.5 * (R + J @ R.conj() @ J.T)
 
 
 def covariance(x, f_hz: float, geometry: Geometry | None = None,
@@ -75,12 +93,17 @@ def covariance(x, f_hz: float, geometry: Geometry | None = None,
     if x.ndim != 2 or x.shape[1] < 1:
         raise ValueError("covariance needs (elements, samples)")
     R = (x @ x.conj().T) / x.shape[1]
-    use_fb = bool(fb) if fb is not None else bool(
-        geometry is not None and geometry.centrosymmetric)
+    R_raw = R
+    perm = geometry.reflection_permutation() if geometry is not None else None
+    use_fb = bool(fb) if fb is not None else perm is not None
     if use_fb:
-        R = forward_backward(R)
+        if geometry is not None and perm is None:
+            raise ValueError("forward-backward averaging asked for on an array that is not "
+                             "its own point reflection")
+        R = forward_backward(R, perm)
     return Covariance(R=R, snapshots=int(snapshots or x.shape[1]),
-                      f_hz=float(f_hz), bw_hz=float(bw_hz), fb=use_fb)
+                      f_hz=float(f_hz), bw_hz=float(bw_hz), fb=use_fb,
+                      R_raw=(R_raw if use_fb else None))
 
 
 def band_snapshots(x, fs: float, f_lo: float, f_hi: float, nfft: int = 256,
@@ -419,6 +442,71 @@ def build_likelihood(peaks, sigma_deg: float, floor: float = LIKELIHOOD_FLOOR) -
     return (dens / dens.sum()).astype(np.float64)
 
 
+def _kind_key(manifold) -> str:
+    """The manifold kind MODEL_SIGMA_DEG is keyed by (a beamspace wrapper is
+    as good as the manifold under it)."""
+    k = getattr(manifold, "model_kind", None) or getattr(manifold, "kind", "ideal")
+    return k if k in MODEL_SIGMA_DEG else "ideal"
+
+
+#: the furthest off a panel's face the model sigma keeps growing (cos 75°):
+#: past that the bearing is at the FOV edge anyway and says so.
+_SCAN_COS_FLOOR = math.cos(math.radians(75.0))
+
+
+def model_sigma_deg(manifold, geometry: Geometry | None, theta_deg: float) -> float:
+    """The error the data cannot see (MODEL_SIGMA_DEG), grown off a flat
+    panel's boresight: a steered beam broadens as 1/cos of the scan angle and
+    calibration error grows with it (§11.4.1, lit2 §1.8). Arrays without one
+    common boresight (whips, a UCA, a multi-face mast) are unchanged."""
+    return MODEL_SIGMA_DEG.get(_kind_key(manifold), 4.0) * scan_factor(geometry, theta_deg)
+
+
+def scan_factor(geometry: Geometry | None, theta_deg: float) -> float:
+    """1/cos of the angle off a flat panel's boresight (floored at cos 75°);
+    1 for arrays with no common boresight."""
+    b = geometry.boresight_common_deg() if geometry is not None else None
+    if b is None:
+        return 1.0
+    c = math.cos(math.radians(((theta_deg - b + 180.0) % 360.0) - 180.0))
+    return 1.0 / max(c, _SCAN_COS_FLOOR)
+
+
+def fov_likelihood(lik: np.ndarray, geometry: Geometry | None) -> np.ndarray:
+    """Outside the field of view the array sees only through its back lobe,
+    so the data says nothing about WHERE out there an emitter is: the
+    likelihood there is flat, at the back-lobe level (or the usual floor if
+    that is higher). Inside, the peaks keep their shape. No FOV: unchanged."""
+    if geometry is None or geometry.fov_az_deg is None:
+        return lik
+    inside = geometry.in_fov(np.arange(360.0))
+    if inside.all():
+        return lik
+    out = np.asarray(lik, dtype=float).copy()
+    level = max(LIKELIHOOD_FLOOR, geometry.back_lobe_power()) / 360.0
+    out[~inside] = level
+    inside_mass = float(out[inside].sum())
+    out_mass = level * int((~inside).sum())
+    if inside_mass > 0:
+        out[inside] *= max(1.0 - out_mass, 1e-6) / inside_mass
+    return out / out.sum()
+
+
+def _fov_note(geometry: Geometry | None, theta_deg: float, quality: dict, caveats: list) -> None:
+    if geometry is None or geometry.fov_az_deg is None:
+        return
+    inside = bool(geometry.in_fov(np.array([theta_deg]))[0])
+    edge = geometry.fov_edge_distance_deg(theta_deg)
+    quality["in_fov"] = inside
+    quality["fov_edge_deg"] = round(edge, 1) if math.isfinite(edge) else None
+    if not inside:
+        caveats.append("OUTSIDE THE FIELD OF VIEW: no peak inside it; this bearing "
+                       "is through the back lobe and is not to be trusted")
+    elif edge < 3.0:
+        caveats.append(f"AT THE EDGE OF THE FIELD OF VIEW ({edge:.1f}° from it): the "
+                       f"emitter may be outside it, seen through a sidelobe")
+
+
 @dataclass
 class DoaResult:
     theta_deg: float
@@ -467,10 +555,17 @@ def estimate(x, manifold: Manifold, f_hz: float, method: str = "music",
     if isinstance(x, Covariance):
         cov = x
     else:
-        cov = covariance(x, f_hz, geometry=geometry, snapshots=snapshots)
+        # Forward-backward averaging assumes the REAL array is its own mirror
+        # image. A measured (or perturbed, or beamspace) manifold says it is
+        # not — averaging would then corrupt the covariance the manifold is
+        # about to be matched against — so FB is for the ideal manifold only.
+        fb = None if getattr(manifold, "kind", "ideal") == "ideal" else False
+        cov = covariance(x, f_hz, geometry=geometry, snapshots=snapshots, fb=fb)
     R = cov.R
     n = R.shape[0]
     grid_deg, A = steering_grid(manifold, f_hz, step_deg)
+    fov = geometry.in_fov(grid_deg)
+    restricted = not bool(fov.all())
     _sig, _noise, vals = noise_subspace(R, 1)
     enum = enumerate_sources(vals, cov.snapshots, fb=cov.fb)
     # a subspace method can resolve at most n-1 sources; clamp an explicit
@@ -515,66 +610,78 @@ def estimate(x, manifold: Manifold, f_hz: float, method: str = "music",
             spec = music_spectrum(En, A)
     elif method == "root":
         roots = root_music(En, manifold, f_hz, k)
+        if restricted:
+            roots = [r for r in roots if geometry.in_fov(np.array([r[0]]))[0]]
         spec = bartlett_spectrum(R, A)
         if roots:
             th0 = roots[0][0]
             snr = _snr_from_eigs(vals, k)
             sig = math.hypot(cramer_rao_deg(snr, cov.snapshots, geometry, f_hz, th0),
-                             MODEL_SIGMA_DEG.get(kind, 4.0))
-            peaks = find_peaks(spec, grid_deg, within_db=AMBIGUITY_DB)
-            lik = build_likelihood([(t, v) for t, v, _ in peaks], sig)
+                             model_sigma_deg(manifold, geometry, th0))
+            pspec = np.where(fov, spec, spec.min()) if restricted else spec
+            peaks = find_peaks(pspec, grid_deg, within_db=AMBIGUITY_DB)
+            lik = fov_likelihood(build_likelihood([(t, v) for t, v, _ in peaks], sig), geometry)
+            quality = {"confidence": float(enum["confidence"]),
+                       "snr_db": round(10 * math.log10(snr), 1),
+                       "n_snapshots": cov.snapshots,
+                       "source_count_mdl": enum["mdl"],
+                       "root_radius": round(roots[0][1], 4)}
+            _fov_note(geometry, th0, quality, caveats)
             return DoaResult(theta_deg=th0, sigma_deg=sig, estimator="root-music",
                              manifold=kind, n_sources=k,
                              all_theta_deg=[t for t, _ in roots], grid_deg=grid_deg,
-                             spectrum=spec, likelihood=lik,
-                             quality={"confidence": float(enum["confidence"]),
-                                      "snr_db": round(10 * math.log10(snr), 1),
-                                      "n_snapshots": cov.snapshots,
-                                      "source_count_mdl": enum["mdl"],
-                                      "root_radius": round(roots[0][1], 4)},
+                             spectrum=spec, likelihood=lik, quality=quality,
                              caveats=caveats)
     elif method == "ml":
-        picks = ml_alternating(R, A, grid_deg, k)
+        idx_in = np.nonzero(fov)[0]
+        picks = ml_alternating(R, A[:, idx_in], grid_deg[idx_in], k)
+        picks = [(t, int(idx_in[j])) for t, j in picks]
         spec = bartlett_spectrum(R, A)
-        th0 = picks[0][0] if picks else float(grid_deg[int(np.argmax(spec))])
+        pspec = np.where(fov, spec, spec.min()) if restricted else spec
+        th0 = picks[0][0] if picks else float(grid_deg[int(np.argmax(pspec))])
         snr = _snr_from_eigs(vals, k)
         sig = math.hypot(cramer_rao_deg(snr, cov.snapshots, geometry, f_hz, th0),
-                         MODEL_SIGMA_DEG.get(kind, 4.0))
+                         model_sigma_deg(manifold, geometry, th0))
         peaks = [(t, float(spec[j])) for t, j in picks]
-        lik = build_likelihood(peaks or [(th0, 1.0)], sig)
+        lik = fov_likelihood(build_likelihood(peaks or [(th0, 1.0)], sig), geometry)
         caveats.append("deterministic ML: chosen for coherent sources; the "
                        "bearing set is joint, not independent peaks")
+        quality = {"confidence": float(enum["confidence"]),
+                   "snr_db": round(10 * math.log10(snr), 1),
+                   "n_snapshots": cov.snapshots,
+                   "source_count_mdl": enum["mdl"]}
+        _fov_note(geometry, th0, quality, caveats)
         return DoaResult(theta_deg=th0, sigma_deg=sig, estimator="ml", manifold=kind,
                          n_sources=k, all_theta_deg=[t for t, _ in picks],
                          grid_deg=grid_deg, spectrum=spec, likelihood=lik,
-                         quality={"confidence": float(enum["confidence"]),
-                                  "snr_db": round(10 * math.log10(snr), 1),
-                                  "n_snapshots": cov.snapshots,
-                                  "source_count_mdl": enum["mdl"]},
-                         caveats=caveats)
+                         quality=quality, caveats=caveats)
     else:
         raise ValueError(f"unknown estimator {method!r}; one of {METHODS}")
 
-    peaks = find_peaks(spec, grid_deg, k=max(k, 1), within_db=None)
-    amb = find_peaks(spec, grid_deg, within_db=AMBIGUITY_DB)
+    # peaks come from inside the field of view; the full spectrum stays in
+    # the result for the polar display (what is behind is worth seeing)
+    pspec = np.where(fov, spec, spec.min()) if restricted else spec
+    peaks = find_peaks(pspec, grid_deg, k=max(k, 1), within_db=None)
+    amb = find_peaks(pspec, grid_deg, within_db=AMBIGUITY_DB)
     th0 = peaks[0][0]
     snr = _snr_from_eigs(vals, k)
     sig = math.hypot(cramer_rao_deg(snr, cov.snapshots, geometry, f_hz, th0),
-                     MODEL_SIGMA_DEG.get(kind, 4.0))
-    lik = build_likelihood([(t, v) for t, v, _ in amb], sig)
-    peak_db = 10 * math.log10(spec.max() / max(np.median(spec), 1e-300))
+                     model_sigma_deg(manifold, geometry, th0))
+    lik = fov_likelihood(build_likelihood([(t, v) for t, v, _ in amb], sig), geometry)
+    peak_db = 10 * math.log10(pspec.max() / max(np.median(spec), 1e-300))
     eig_gap = float(vals[k - 1] / max(vals[k], 1e-300)) if k < vals.size else float("inf")
+    quality = {"confidence": float(enum["confidence"]),
+               "peak_ratio_db": round(peak_db, 1),
+               "eigen_gap": round(eig_gap, 2),
+               "snr_db": round(10 * math.log10(snr), 1),
+               "n_snapshots": cov.snapshots,
+               "source_count_mdl": enum["mdl"],
+               "source_count_aic": enum["aic"]}
+    _fov_note(geometry, th0, quality, caveats)
     return DoaResult(theta_deg=th0, sigma_deg=sig, estimator=method, manifold=kind,
                      n_sources=k, all_theta_deg=[t for t, _, _ in peaks[:k]],
                      grid_deg=grid_deg, spectrum=spec, likelihood=lik,
-                     quality={"confidence": float(enum["confidence"]),
-                              "peak_ratio_db": round(peak_db, 1),
-                              "eigen_gap": round(eig_gap, 2),
-                              "snr_db": round(10 * math.log10(snr), 1),
-                              "n_snapshots": cov.snapshots,
-                              "source_count_mdl": enum["mdl"],
-                              "source_count_aic": enum["aic"]},
-                     caveats=caveats)
+                     quality=quality, caveats=caveats)
 
 
 # ---------------------------------------------------------------------------

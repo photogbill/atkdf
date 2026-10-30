@@ -407,3 +407,224 @@ class Simulator:
                 f.write(atkq.pack_header(fr.header))
                 f.write(bytes(fr.payload))
         return str(path)
+
+
+# ---------------------------------------------------------------------------
+# element-level snapshots for any array (2026-10-30, plan §11.4.8)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PlaneWave:
+    """A narrowband plane wave at the array: relative bearing (clockwise from
+    the array's forward axis), elevation (up), per-element SNR in dB against
+    unit noise. `group` > 0 makes waves with the same group share one symbol
+    stream (coherent multipath), each with its own `gain_db` and `phase_deg`."""
+
+    az_deg: float
+    el_deg: float = 0.0
+    snr_db: float = 20.0
+    group: int = 0
+    gain_db: float = 0.0
+    phase_deg: float = 0.0
+
+
+def element_snapshots(manifold: Manifold, waves, f_hz: float, n: int = 1024,
+                      seed: int = 0, noise: bool = True) -> np.ndarray:
+    """(n_elements, n) complex baseband at the ELEMENTS: Σ a(θ, el)·s(t) + unit
+    noise per element. Float, no ADC — for arrays the Kraken's 8-bit frame
+    format cannot carry (16+ elements, analog combiners, elevation). Each
+    independent wave is a unit-power complex Gaussian stream scaled to its
+    SNR; waves in one `group` > 0 share a stream."""
+    rng = np.random.default_rng(seed)
+    geom = getattr(manifold, "geometry", None)
+    n_el = geom.n if geom is not None else manifold.response(0.0, f_hz).shape[0]
+    x = np.zeros((n_el, n), dtype=complex)
+    streams: dict = {}
+    for w in waves:
+        if w.group > 0 and w.group in streams:
+            s = streams[w.group]
+        else:
+            s = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / math.sqrt(2)
+            if w.group > 0:
+                streams[w.group] = s
+        amp = math.sqrt(10 ** (w.snr_db / 10)) * 10 ** (w.gain_db / 20) \
+            * np.exp(1j * math.radians(w.phase_deg))
+        if abs(w.el_deg) > 1e-12:
+            a = manifold.response2(np.array([w.az_deg]), np.array([w.el_deg]), f_hz)[:, 0]
+        else:
+            a = manifold.response(np.array([w.az_deg]), f_hz)[:, 0]
+        x += np.outer(a, amp * s)
+    if noise:
+        x += (rng.standard_normal(x.shape) + 1j * rng.standard_normal(x.shape)) / math.sqrt(2)
+    return x
+
+
+class SteerableArraySim:
+    """A simulated analog / hybrid array behind a `ports.BeamSteerer`
+    (plan §11.4.8): the elements see `waves` through `manifold`; `apply(W)`
+    quantises the weights to the phase-shifter / attenuator steps and returns
+    that (what the controller believes it set); the ELEMENTS actually get the
+    quantised weights times a fixed per-element error (`shifter_rms_deg`,
+    `shifter_gain_rms_db` — "no channel-to-channel match spec", lit2 §1.7),
+    and each OUTPUT has its own fixed gain/phase mismatch. `capture(n)` is
+    fresh element snapshots, combined. `elapsed_s` adds settle and capture
+    time so a sweep can be checked against a burst."""
+
+    def __init__(self, manifold: Manifold, waves, f_hz: float, n_outputs: int = 1,
+                 halves=None, fs_hz: float = 48_000.0, phase_step_deg: float | None = None,
+                 gain_step_db: float | None = None, shifter_rms_deg: float = 0.0,
+                 shifter_gain_rms_db: float = 0.0, output_mismatch_db: float = 0.0,
+                 output_mismatch_deg: float = 0.0, settle_s: float = 1e-6, seed: int = 0,
+                 on_until_s: float | None = None):
+        from .architectures import quantise_weights as _q
+        self._q = _q
+        self.manifold = manifold
+        self.waves = list(waves)
+        self.f_hz = float(f_hz)
+        self.n_outputs = int(n_outputs)
+        self.halves = halves
+        self.fs_hz = float(fs_hz)
+        self.settle_s = float(settle_s)
+        self.phase_step_deg = phase_step_deg
+        self.gain_step_db = gain_step_db
+        self.rng = np.random.default_rng(seed)
+        n = manifold.geometry.n
+        self.element_error = (10 ** (self.rng.normal(0, shifter_gain_rms_db, n) / 20)
+                              * np.exp(1j * np.radians(self.rng.normal(0, shifter_rms_deg, n))))
+        self.output_error = (10 ** (self.rng.normal(0, output_mismatch_db, n_outputs) / 20)
+                             * np.exp(1j * np.radians(self.rng.normal(0, output_mismatch_deg,
+                                                                      n_outputs))))
+        self.on_until_s = on_until_s
+        self.elapsed_s = 0.0
+        self.applied = None
+        self._true = None
+        self.n_applies = 0
+        self._seed = int(seed) * 7919
+
+    def apply(self, weights) -> np.ndarray:
+        W = np.asarray(weights, dtype=complex)
+        if W.ndim == 1:
+            W = W[:, None]
+        Wq = self._q(W, self.phase_step_deg, self.gain_step_db)
+        self.applied = Wq
+        self._true = Wq * self.element_error[:, None]
+        self.elapsed_s += self.settle_s
+        self.n_applies += 1
+        return Wq
+
+    def capture(self, n: int) -> np.ndarray:
+        if self._true is None:
+            raise RuntimeError("apply() weights before capture()")
+        self._seed += 1
+        on = self.on_until_s is None or self.elapsed_s < self.on_until_s
+        x = element_snapshots(self.manifold, self.waves if on else [], self.f_hz, int(n),
+                              seed=self._seed)
+        y = self._true.conj().T @ x
+        y = y * self.output_error[: y.shape[0], None]
+        self.elapsed_s += int(n) / self.fs_hz
+        return y
+
+
+class SwitchedArraySim:
+    """A simulated switched array: `rf_chains` coherent channels, channel
+    `reference_channel` always on `reference_element`, the others switched
+    through `schedule` (one list per slot of the element on each
+    non-reference channel). Each channel has a fixed gain/phase (`rx_*`),
+    the whole receiver a random LO phase per retune (common to the channels
+    — a shared LO), and each slot is a fresh piece of the emitter's signal.
+    `off_after_slot` ends the transmission part-way through the sequence."""
+
+    def __init__(self, manifold: Manifold, waves, f_hz: float, reference_element: int,
+                 schedule, rf_chains: int = 2, reference_channel: int = 0,
+                 dwell_samples: int = 2048, rx_gain_db=None, rx_phase_deg=None,
+                 off_after_slot: int | None = None, seed: int = 0):
+        self.manifold = manifold
+        self.waves = list(waves)
+        self.f_hz = float(f_hz)
+        self.ref_el = int(reference_element)
+        self.ref_ch = int(reference_channel)
+        self.schedule = [list(s) for s in schedule]
+        self.ch = int(rf_chains)
+        self.dwell = int(dwell_samples)
+        self.rng = np.random.default_rng(seed)
+        g = (np.asarray(rx_gain_db, float) if rx_gain_db is not None
+             else self.rng.normal(0, 1.0, self.ch))
+        p = (np.asarray(rx_phase_deg, float) if rx_phase_deg is not None
+             else self.rng.uniform(-180, 180, self.ch))
+        self.rx = 10 ** (g / 20) * np.exp(1j * np.radians(p))
+        self.off_after = off_after_slot
+        self._seed = int(seed) * 104729
+
+    def retune(self) -> None:
+        """A new random LO phase, common to every channel."""
+        self.rx = self.rx * np.exp(1j * self.rng.uniform(-np.pi, np.pi))
+
+    def capture_sequence(self) -> list:
+        out = []
+        for i, slot in enumerate(self.schedule):
+            self._seed += 1
+            waves = self.waves if (self.off_after is None or i <= self.off_after) else []
+            x = element_snapshots(self.manifold, waves, self.f_hz, self.dwell, seed=self._seed)
+            elements = []
+            k = 0
+            for c in range(self.ch):
+                if c == self.ref_ch:
+                    elements.append(self.ref_el)
+                else:
+                    elements.append(int(slot[k]))
+                    k += 1
+            Y = x[elements] * self.rx[:, None]
+            out.append((elements, Y))
+        return out
+
+
+class ReceiverBank:
+    """Receiver channels grouped into LO domains (one per device, or one for
+    a shared LO), behaving like a hardware class on retune and power-up
+    (lit2 §3.18, §4.6; plan §11.4.8):
+
+      on_retune      keep    — LO shared and deterministic (TwinRX, N321 star)
+                     random  — independent LOs: a new phase per domain (Kraken,
+                               two B210s)
+                     flip180 — N310 external LO: 0° or 180° per domain
+      on_power_cycle keep    — the table survives a reboot (TwinRX, NI-2955)
+                     random  — new phases per domain (N310/N32x class)
+
+    Each channel also has a fixed cable/gain offset. `apply(x)` multiplies
+    element-ordered samples by the current channel response; `truth()` is
+    the receiver table that would undo it (channel 0 = 1)."""
+
+    def __init__(self, n: int, domains=None, on_retune: str = "keep",
+                 on_power_cycle: str = "keep", seed: int = 0):
+        self.n = int(n)
+        self.domains = list(domains) if domains is not None else [0] * self.n
+        self.on_retune = on_retune
+        self.on_power_cycle = on_power_cycle
+        self.rng = np.random.default_rng(seed)
+        self.fixed = (10 ** (self.rng.normal(0, 0.5, self.n) / 20)
+                      * np.exp(1j * self.rng.uniform(-np.pi, np.pi, self.n)))
+        nd = max(self.domains) + 1
+        self.lo = np.exp(1j * self.rng.uniform(-np.pi, np.pi, nd))
+
+    def _new(self, how: str) -> None:
+        nd = self.lo.size
+        if how == "random":
+            self.lo = np.exp(1j * self.rng.uniform(-np.pi, np.pi, nd))
+        elif how == "flip180":
+            self.lo = self.lo * np.where(self.rng.random(nd) < 0.5, -1.0, 1.0)
+
+    def retune(self) -> None:
+        self._new(self.on_retune)
+
+    def power_cycle(self) -> None:
+        self._new(self.on_power_cycle)
+
+    def response(self) -> np.ndarray:
+        return self.fixed * self.lo[self.domains]
+
+    def apply(self, x) -> np.ndarray:
+        return np.asarray(x) * self.response()[:, None]
+
+    def truth(self) -> np.ndarray:
+        r = self.response()
+        return r[0] / r

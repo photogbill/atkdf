@@ -53,6 +53,7 @@ import numpy as np
 from . import calibration
 from . import doa as _doa
 from . import identity as _identity
+from . import health as _health
 from . import integrate as _integrate
 from .atkq import Flag, Frame
 from .manifold import Geometry, IdealManifold, Manifold
@@ -170,6 +171,17 @@ class Engine:
     #: The DoaResult behind the last bearing (its pseudo-spectrum is what a
     #: polar display draws).
     last_result: object | None = None
+    #: A `health.ChannelHealth` (plan §11.4.4): each covariance is checked
+    #: for dead / noisy / wandering channels and a bad element is dropped
+    #: before the estimate (its sigma raised, the record saying which).
+    #: None = off, as before.
+    health: object | None = None
+    #: A `timing.TimingState` (plan §11.4.6): every record carries its tier
+    #: and the time error at that instant. None = T0, as before.
+    timing: object | None = None
+    #: Set by the caller while a parked reference is in view, so the health
+    #: monitor may judge "wandering".
+    stationary_reference: bool = False
     _pending: list = field(default_factory=list)
     n_frames: int = 0
     n_records: int = 0
@@ -323,9 +335,57 @@ class Engine:
             return fix, float(fix.course_deg), self._heading_sigma(fix)
         return fix, None, None
 
+    def _fb(self):
+        """Forward-backward averaging only on the ideal manifold (a measured
+        one says the real array is not its own mirror image); None lets the
+        geometry decide."""
+        return None if getattr(self.manifold, "kind", "ideal") == "ideal" else False
+
     def _estimate(self, src, f_hz):
-        return _doa.estimate(src, self.manifold, f_hz, method=self.mode.estimator,
-                             geometry=self.geometry)
+        if self.health is None or not isinstance(src, _doa.Covariance):
+            return _doa.estimate(src, self.manifold, f_hz, method=self.mode.estimator,
+                                 geometry=self.geometry)
+        # health reads the RAW covariance: forward-backward averaging would
+        # hide a dead element behind its live mirror (it inherits half the
+        # mirror's power), so a check on src.R reports a dead channel healthy
+        rep = self.health.check(src.raw, stationary_reference=self.stationary_reference)
+        if rep.ok:
+            return _doa.estimate(src, self.manifold, f_hz, method=self.mode.estimator,
+                                 geometry=self.geometry)
+        man, geom, keep = _health.drop_bad(self.manifold, rep, self.geometry)
+        # rebuild the covariance from the RAW matrix on the kept elements, then
+        # re-apply forward-backward only if the SMALLER array is still its own
+        # point reflection (dropping one element usually breaks that), so a
+        # valid covariance — not a slice of an FB matrix whose mirror pairing
+        # the drop destroyed — reaches the estimator
+        R_keep = src.raw[np.ix_(keep, keep)]
+        perm = geom.reflection_permutation()
+        usefb = (getattr(man, "kind", "ideal") == "ideal") and perm is not None
+        if usefb:
+            R_keep = _doa.forward_backward(R_keep, perm)
+        sub = _doa.Covariance(R=R_keep, snapshots=src.snapshots, f_hz=src.f_hz,
+                              bw_hz=src.bw_hz, fb=usefb,
+                              R_raw=(src.raw[np.ix_(keep, keep)] if usefb else None))
+        res = _doa.estimate(sub, man, f_hz, method=self.mode.estimator, geometry=geom)
+        model = _doa.model_sigma_deg(man, geom, res.theta_deg)
+        res.sigma_deg = _health.inflate_sigma(res.sigma_deg, model)
+        fov = geom.in_fov(res.grid_deg)
+        spec = np.where(fov, res.spectrum, res.spectrum.min())
+        peaks = _doa.find_peaks(spec, res.grid_deg, within_db=_doa.AMBIGUITY_DB)
+        res.likelihood = _doa.fov_likelihood(
+            _doa.build_likelihood([(t, v) for t, v, _ in peaks] or [(res.theta_deg, 1.0)],
+                                  res.sigma_deg), geom)
+        res.quality["dropped_elements"] = list(rep.bad)
+        res.quality["channel_health"] = list(rep.status)
+        res.caveats = list(res.caveats) + [
+            f"CHANNEL HEALTH: {rep.sentence()} — dropped; bearing from the other "
+            f"{len(keep)} elements, sigma raised (the dead element's termination "
+            f"changed the coupling the manifold assumed)"]
+        note = _health.fragility_note(self.geometry)
+        if note:
+            res.caveats.append(note)
+        log.warning("engine: dropped elements %s (%s)", rep.bad, rep.sentence())
+        return res
 
     def _choose(self, cov_res, hits, f_hz) -> tuple:
         """(primary DoaResult, extra quality, extra notes).
@@ -415,7 +475,7 @@ class Engine:
                 self.last_status = status
                 return None
             src = _doa.covariance(Y, f_hz, geometry=self.geometry, snapshots=neff,
-                                  bw_hz=band[1] - band[0])
+                                  bw_hz=band[1] - band[0], fb=self._fb())
             extra_q["band_snr_db"] = status["band_snr_db"]
             extra_q["channel_db"] = status["channel_db"]
         else:
@@ -485,7 +545,7 @@ class Engine:
             burst.last_sync_t = t_hi
         # the interim needle: everything integrated so far, no record
         try:
-            cov = burst.covariance(self.geometry)
+            cov = burst.covariance(self.geometry, fb=self._fb())
             res = self._estimate(cov, f_hz)
             res, _q, _n = self._choose(res, burst.pilot_hits, f_hz)
             self.last_result = res
@@ -523,7 +583,7 @@ class Engine:
                   "integrated_ms": round(1000.0 * b.duration_s, 1),
                   "n_snapshots": int(b.neff), "burst_end": b.end_reason}
         try:
-            cov_res = self._estimate(b.covariance(self.geometry), b.f_hz)
+            cov_res = self._estimate(b.covariance(self.geometry, fb=self._fb()), b.f_hz)
         except Exception as exc:                            # noqa: BLE001
             cov_res = None
             if not b.pilot_hits:
@@ -558,11 +618,18 @@ class Engine:
         fc = getattr(self, "_grid_fc", None)
         if fc is None:
             return out
-        fb = bool(getattr(self.geometry, "centrosymmetric", False))
+        # forward-backward exactly as a band burst's covariance takes it
+        # (integrate.Burst.covariance): the array's own reflection, only where
+        # the manifold allows it (`_fb`), and the raw matrix kept for the
+        # channel-health check
+        perm = self.geometry.reflection_permutation()
+        want = self._fb()
+        fb = bool(want) if want is not None else perm is not None
         for gb in bursts:
             f_hz = fc + gb.f_off_hz
-            R = _doa.forward_backward(gb.R) if fb else gb.R
-            cov = _doa.Covariance(R=R, snapshots=int(gb.snapshots), f_hz=f_hz, bw_hz=gb.bw_hz, fb=fb)
+            R = _doa.forward_backward(gb.R, perm) if fb else gb.R
+            cov = _doa.Covariance(R=R, snapshots=int(gb.snapshots), f_hz=f_hz, bw_hz=gb.bw_hz, fb=fb,
+                                  R_raw=(gb.R if fb else None))
             t_mid = self._t_of((gb.n0 + gb.n1) // 2)
             status = {"t_utc": t_mid, "state": "bearing", "fc_hz": f_hz, "bw_hz": gb.bw_hz,
                       "integrated_ms": round(1000.0 * (gb.n1 - gb.n0) / self._fs, 1),
@@ -646,7 +713,10 @@ class Engine:
             passport_uid=(passport_uid if passport_uid is not None
                           else (self.passport.uid if self.passport else "")),
             manifold=getattr(self.manifold, "kind", "ideal"),
-            notes=list(res.caveats) + list(notes))
+            notes=list(res.caveats) + list(notes),
+            timing_tier=(self.timing.tier if self.timing is not None else "T0"),
+            t_utc_sigma_ns=(round(self.timing.sigma_ns(t_utc), 1)
+                            if self.timing is not None else None))
         status["theta_abs_deg"] = theta_abs
         status["sigma_deg"] = float(sigma)
         status["path_tag"] = path_tag
