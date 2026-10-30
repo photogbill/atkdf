@@ -26,6 +26,7 @@ from . import (atkq, calibration, doa, engine, exports, fakes, heading, identity
 # pilots (pilots imports atkdsp only when a PilotStage is built without an
 # injected correlator — importing it here costs nothing)
 from . import bandplan, integrate, pilots
+from . import channel_grid
 from .dossier import Measurement
 from .engine import Engine, PlatformMode
 from .heading import HeadingFilter

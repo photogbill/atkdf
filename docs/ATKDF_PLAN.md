@@ -816,3 +816,43 @@ clip through `reprocess`) are the next check. The channel-grid DF-everything
 path waits on atkdsp's channelizer; `MeasuredManifold` / `ErrorModel` on the
 live path, the kr gate, IAA, CEP on the map and baseline thinning are Tier 2.
 
+## 16. 2026-10-30 — the phased-array option (pointer)
+
+Bill asked for a DF configuration for a phased array (hardware not yet
+chosen; Ettus/NI USRPs expected) and for several arrays on one network. The
+specification is ATK's `docs/DF_P25_IMPROVEMENT_PLAN.md` **§11.4** and its
+literature companion `docs/DF_PHASED_ARRAY_LITERATURE_2020_2026.md` (cited
+there as *lit2*). What lands in this repo, in build order (nothing built yet):
+
+1. **Array profile schema v2** (§11.4.1) — one JSON per array; new
+   first-class fields `architecture` {digital | switched | analog | hybrid},
+   `lo_sharing`, `rx_cal_persistence`, `timing.tier` T0–T5, `rf_chains`,
+   `subarrays`, `steering`, two calibration tables, `cable_class`. The Kraken
+   becomes profile `kraken5_uca`. `manifold.Geometry` goes to 3-D positions
+   with per-element phase centres and amplitudes; FOV enters the search.
+2. **Architecture dispatcher** above `doa.estimate` (§11.4.2): switched
+   (pseudo-coherent re-referencing), analog beam-scan (stored beam manifold +
+   quadratic peak fit) and monopulse (phase comparison, measured slope),
+   hybrid (fold quantised weights: A_b = Wᴴa(θ), sources per slot < RF chains,
+   explicit subarray phase-centre disambiguation). Analog/switched paths are
+   single-source and say so.
+3. **Two calibration tables** with the per-hardware-class persistence policy,
+   a `CoherenceMonitor`-bound recal trigger, and the dead/noisy/wandering
+   channel detector with EADF re-fit (§11.4.4).
+4. **Timing tiers** in the frame header and on every `BearingRecord`; the
+   network tiers (bearings always, channelised I/Q when cued and timed, raw
+   never) and the timing state machine on the peers layer; SigMF `spatial`
+   writer/reader (§11.4.6).
+5. **2-D DoA** — reduced-dimension root-MUSIC with pairing on the 2-D EADF,
+   Kronecker ESPRIT fallback for URAs (§11.4.5).
+6. With hardware: the UHD `multi_usrp` `FrameSource` (X310 + TwinRX first),
+   DIFI import, measured tables.
+
+Simulator additions that come first (§11.4.8): weight quantisation and
+channel mismatch, combiner switch time, subarray ambiguity, random LO phase
+per device per retune with 180° flips, cable thermal phase, LO-shared
+sub-0.1° residual, GPSDO timing tier with holdover.
+
+The rule that governs all of it: **several USRPs are one array only when
+LO-shared on one platform** (T4); a cabled 10 MHz/PPS alone (T3) does not make
+one array, and coherent combining between vehicles is not a feature.

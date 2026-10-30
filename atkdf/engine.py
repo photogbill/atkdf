@@ -155,6 +155,12 @@ class Engine:
     #: pilot bearing becomes the record only on real sync evidence
     #: (`pilots.evidence_enough`); otherwise it rides along in `quality`.
     pilots: object | None = None
+    #: A `channel_grid.ChannelGrid` — DF EVERYTHING: every channel that lights
+    #: up in the window gets its own whole-transmission covariance and one
+    #: bearing when it ends, with no decoder and no retune (channel_grid.py).
+    #: It replaces the survey bearing; decoder bursts still run as before.
+    #: None = off.
+    grid: object | None = None
     #: What the last frame came to, for a live display: state is one of
     #: unusable | no_target | squelched | low_confidence | bearing | error,
     #: with the band SNR, per-channel band power and why. Replaced, never
@@ -188,6 +194,11 @@ class Engine:
                 out += self._finish_bursts(self._integ.flush("retune"))
             if self.pilots is not None:
                 self.pilots.reset()
+            if self.grid is not None:
+                # what was open was heard at the OLD tuning: its bearing, then
+                # a clean grid for the new one
+                out += self._grid_records(self.grid.flush("retune"), None)
+                self.grid.reset()
         if not h.usable_for_df:
             self.last_status = {"t_utc": h.t_utc, "state": "unusable",
                                 "why": "; ".join(h.why_not_usable()),
@@ -241,7 +252,9 @@ class Engine:
                                 pilot_hits=hits)
             if rec is not None:
                 out.append(rec)
-        if not used_burst and self.mode.survey:
+        if self.grid is not None:
+            out += self._grid_step(h, calibrated())
+        elif not used_burst and self.mode.survey:
             rec = self._bearing(h, calibrated(), frame, band=None, event=None,
                                 span=(s0, s1))
             if rec is not None:
@@ -255,6 +268,8 @@ class Engine:
         """End every open burst now (end of a file, DF stopped) and return
         their records."""
         recs = self._finish_bursts(self._integ.flush(reason))
+        if self.grid is not None:
+            recs += self._grid_records(self.grid.flush(reason), None)
         self.n_records += len(recs)
         return recs
 
@@ -524,6 +539,51 @@ class Engine:
         return self._record(b.t_mid, None, res, b.f_hz, band, b.event, (b.n0, b.n1),
                             status, q, notes, b.pilot_hits, segment=b.segment,
                             passport_uid=(b.passports[0] if b.passports else ""))
+
+    # -- DF everything (channel_grid.py) ------------------------------------------
+    def _grid_step(self, h, x_el) -> list:
+        if abs(float(self.grid.fs) - float(h.fs_hz)) > 0.5:     # the radio's rate changed
+            out = self._grid_records(self.grid.flush("rate"), None)
+            self.grid = self.grid.rebuild(float(h.fs_hz))
+        else:
+            out = []
+        self._grid_fc = float(h.fc_hz)
+        self._grid_seg = int(h.segment)
+        return out + self._grid_records(self.grid.process(x_el, int(h.stream_sample0)), h)
+
+    def _grid_records(self, bursts, h) -> list:
+        """One record per channel transmission, through the same estimator,
+        likelihood and record as a band burst (`_estimate`, `_record`)."""
+        out = []
+        fc = getattr(self, "_grid_fc", None)
+        if fc is None:
+            return out
+        fb = bool(getattr(self.geometry, "centrosymmetric", False))
+        for gb in bursts:
+            f_hz = fc + gb.f_off_hz
+            R = _doa.forward_backward(gb.R) if fb else gb.R
+            cov = _doa.Covariance(R=R, snapshots=int(gb.snapshots), f_hz=f_hz, bw_hz=gb.bw_hz, fb=fb)
+            t_mid = self._t_of((gb.n0 + gb.n1) // 2)
+            status = {"t_utc": t_mid, "state": "bearing", "fc_hz": f_hz, "bw_hz": gb.bw_hz,
+                      "integrated_ms": round(1000.0 * (gb.n1 - gb.n0) / self._fs, 1),
+                      "n_snapshots": int(gb.snapshots), "burst_end": gb.end_reason, "source": "grid"}
+            try:
+                res = self._estimate(cov, f_hz)
+            except Exception as exc:                        # noqa: BLE001
+                log.warning("DF everything: channel %d (%.4f MHz) could not be estimated: %s: %s",
+                            gb.chan, f_hz / 1e6, type(exc).__name__, exc)
+                continue
+            q = {"method": "DF everything (channel-grid covariance)", "grid_channel": int(gb.chan),
+                 "grid_power_db": round(float(gb.power_db), 1), "grid_backend": gb.backend,
+                 "integrated_ms": status["integrated_ms"]}
+            rec = self._record(t_mid, h, res, f_hz, (-0.5 * gb.bw_hz, 0.5 * gb.bw_hz), None,
+                               (gb.n0, gb.n1), status, q,
+                               [f"DF everything: channel {gb.chan}, {gb.bw_hz / 1e3:.2f} kHz, "
+                                f"{gb.hops} hops ({gb.end_reason})"], [],
+                               segment=(h.segment if h is not None else getattr(self, "_grid_seg", 0)))
+            if rec is not None:
+                out.append(rec)
+        return out
 
     # -- the record ------------------------------------------------------------
     def _record(self, t_utc, h, res, f_hz, band, event, span, status, extra_q, notes,
