@@ -693,3 +693,22 @@ noise-like emitters by their pair cross-correlations; the pair phases are a
 rough bearing. `atkdf` takes it as a wide, low-weight line of bearing from a
 `ports.Detection` with `signature{"xcorr": …}`, never as a fix on its own.
 No separate option — it follows the radiometer's box.
+
+## 14. 2026-10-29 — the P25 DF improvement plan (pointer)
+
+A prospective P25 DF job (3dB Labs' Sceptre as the benchmark; phased arrays
+possible) prompted a code review of this engine, atkdaq and ATK's live path
+plus a five-year literature sweep. Both live in ATK: `ATK\docs\DF_P25_IMPROVEMENT_PLAN.md`
+(findings, the P25-aware chain, validation campaign, what to wire, estimator
+and tracking upgrades, the phased-array port, the Sceptre comparison, build
+order) and `ATK\docs\DF_LITERATURE_2021_2026.md` (the sweep, with a verdict
+per item for this hardware). What that plan asks of THIS repo, in order:
+`pilots.py` wired to atkdsp's `DmrSync` (§6.5 here, never written);
+burst-level covariance integration across frames in `engine.py`; the P25
+path tag by frequency/modulation in `identity.py`; `MeasuredManifold` and
+`ErrorModel` on the live path; the channel-grid "DF everything" source once
+atkdsp's channelizer lands (`atkdsp\docs\CHANNELIZER_DF_REQUIREMENTS.md`);
+then `doa.iaa`, the kr gate on the phase-mode path, the circulant
+parametrisation in `calibration.self_cal`, robust mixture likelihoods in
+`fusion`, and `timing_source` on the frame header for non-Kraken sources.
+Nothing in §0–§13 above changes.
