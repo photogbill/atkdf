@@ -13,7 +13,8 @@ import numpy as np
 
 from .geodesy import bearing_between, distance_between
 from .ports import (BurstEvent, Catalogue, CueSource, Detection, Edge, Elevation,
-                    Fix2D, PathLoss, Positioning, Profile, Reference, RoadGraph)
+                    FieldResult, Fix2D, PathLoss, Positioning, Profile,
+                    Reference, RoadGraph)
 
 
 class StaticPositioning:
@@ -118,6 +119,41 @@ class FreeSpaceLoss:
                 if v > -0.78:
                     fspl += 6.9 + 20 * math.log10(math.hypot(v - 0.1, 1) + v - 0.1)
         return float(fspl)
+
+
+class FreeSpaceField:
+    """A `LossField` with no terrain: free-space loss from the receiver to
+    every cell, everything in line of sight. Turns a terrain likelihood into
+    a pure range term, so a test can isolate it. `wall_bearing_deg`, if set,
+    hides every cell within `wall_width_deg` of that bearing beyond
+    `wall_range_m` and adds `wall_loss_db` there — one shadow of known shape,
+    enough to prove a shadow likelihood does something without a DEM."""
+
+    def __init__(self, wall_bearing_deg: float | None = None, wall_range_m: float = 5_000.0,
+                 wall_width_deg: float = 30.0, wall_loss_db: float = 30.0):
+        self.wall_bearing_deg = wall_bearing_deg
+        self.wall_range_m = float(wall_range_m)
+        self.wall_width_deg = float(wall_width_deg)
+        self.wall_loss_db = float(wall_loss_db)
+
+    def field(self, rx, spec, f_hz: float, h_rx_m: float, h_tx_m: float) -> FieldResult:
+        from .geodesy import geodetic_to_enu
+        e, n = spec.axes()
+        E, N = np.meshgrid(e, n)
+        re, rn, _ = geodetic_to_enu(rx[0], rx[1], 0.0, (spec.ref_lat, spec.ref_lon, 0.0))
+        de, dn = E - re, N - rn
+        d = np.maximum(np.hypot(de, dn), 1.0)
+        loss = 20.0 * np.log10(4.0 * math.pi * d * float(f_hz) / 299_792_458.0)
+        visible = np.ones(d.shape, dtype=bool)
+        if self.wall_bearing_deg is not None:
+            brg = np.degrees(np.arctan2(de, dn)) % 360.0
+            off = np.abs((brg - self.wall_bearing_deg + 180.0) % 360.0 - 180.0)
+            hidden = (off <= self.wall_width_deg / 2.0) & (d > self.wall_range_m)
+            loss = np.where(hidden, loss + self.wall_loss_db, loss)
+            visible = ~hidden
+        return FieldResult(loss_db=loss.astype(np.float32), visible=visible,
+                           terrain_res_m=float(spec.cell_m), coarse_cell_m=float(spec.cell_m),
+                           model="free space (fake)", sources=["no terrain (fake)"])
 
 
 class EmptyCatalogue:

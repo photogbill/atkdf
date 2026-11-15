@@ -125,6 +125,36 @@ class Profile:
 
 
 @dataclass
+class FieldResult:
+    """Path loss from the receiver to EVERY cell of a posterior grid, in the
+    grid's own layout: `(n, n)`, north (row) by east (column), the same as
+    `posterior.Posterior.logp`.
+
+    Added 2026-11-14 with the `LossField` port. A posterior is millions of
+    cells; `PathLoss.loss_db` answers one path, and one call per cell per
+    bearing is not a slow answer, it is no answer. So terrain reaches the
+    posterior as a field, computed once per receiver position on a coarse
+    grid and upsampled.
+
+    `loss_db`        dB, float32. By reciprocity it is also the loss from an
+                     emitter in that cell to the receiver.
+    `visible`        True where the cell is in line of sight of the receiver
+                     over the terrain (geometry, not signal)
+    `terrain_res_m`  post spacing of the terrain that answered — the wider
+                     it is, the less a shadow edge should be trusted
+    `coarse_cell_m`  the cell size the field was actually computed at
+    """
+
+    loss_db: np.ndarray
+    visible: np.ndarray
+    terrain_res_m: float = 30.0
+    coarse_cell_m: float = 0.0
+    model: str = ""
+    sources: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+
+@dataclass
 class Edge:
     """A road-graph edge: an id, its endpoints, and a length. `neighbours`
     are the ids reachable from its far end."""
@@ -232,6 +262,17 @@ class Catalogue(Protocol):
 
     def lookup(self, key: str) -> "Reference | None": ...
     def near(self, lat: float, lon: float, radius_m: float) -> list: ...
+
+
+@runtime_checkable
+class LossField(Protocol):
+    """Propagation loss from the receiver to every cell of a grid: ATK's
+    terrain and propagation engine (atkprop), or a free-space fake. `spec` is
+    a `posterior.GridSpec`; `rx` is (lat, lon); `h_rx_m` and `h_tx_m` are
+    antenna heights above ground at the receiver and at the cells."""
+
+    def field(self, rx: tuple, spec, f_hz: float, h_rx_m: float,
+              h_tx_m: float) -> FieldResult: ...
 
 
 @runtime_checkable
