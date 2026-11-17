@@ -10,8 +10,9 @@ header disagree, the header wins and this module is the bug.
 (`tests/fixtures/synth_240k.atkq`), which is what holds this reader to that
 writer.
 
-WHAT A FRAME IS. A 96-byte fixed header, then one 32-byte record per channel
-(found through `ch_offset` / `ch_stride`, never assumed), then the payload:
+WHAT A FRAME IS. A 96-byte fixed header, then one record per channel — 40
+bytes since atkdaq 0.2.0 (2026-11-16), 32 before; found through `ch_offset` /
+`ch_stride`, never assumed — then the payload:
 `n_channels × samples_per_ch` int8 I/Q pairs, CHANNEL-MAJOR. The DAQ has
 already applied each channel's integer delay; what it REPORTS and does not
 apply is each channel's complex weight `w` and its fractional delay `frac`.
@@ -48,7 +49,8 @@ import numpy as np
 MAGIC = b"ATKQ"
 VERSION = 1
 FIXED_BYTES = 96
-CH_STRIDE = 32
+CH_STRIDE = 40          # what this module writes (atkdaq 0.2.0+: per-channel gain)
+CH_STRIDE_V1 = 32       # the smallest record accepted (recordings before 2026-11-16)
 MAX_CHANNELS = 16
 
 
@@ -65,6 +67,7 @@ class Flag(IntFlag):
     CLIPPED = 1 << 6
     DISCONTINUITY = 1 << 7
     SYNTHETIC = 1 << 8
+    GAIN_SPLIT = 1 << 9     # channels at different gains: read each channel's record
 
 
 class CalState(IntEnum):
@@ -108,6 +111,9 @@ _FIELDS = (
 _CH_FIELDS = (("delay", "i", 0), ("frac_delay", "f", 4), ("w_re", "f", 8),
               ("w_im", "f", 12), ("drops", "I", 16), ("clip", "I", 20),
               ("sample_count", "Q", 24))
+#: Appended to the channel record 2026-11-16 (record 32 -> 40 bytes, still wire
+#: version 1): this channel's own tuner gain. Bytes 34..39 are reserved, zero.
+_CH_GAIN = ("gain_tenths_db", "h", 32)
 
 
 @dataclass(frozen=True)
@@ -120,6 +126,8 @@ class Channel:
     drops: int = 0          # samples believed lost since the last sync
     clip: int = 0           # samples in THIS frame at the ADC rail
     sample_count: int = 0   # raw samples received since the stream started
+    gain_tenths_db: int | None = None   # this channel's gain; None = not in the
+                                        # record (a 32-byte one): the header's
 
 
 @dataclass(frozen=True)
@@ -184,6 +192,14 @@ class Header:
     @property
     def frac_delays(self) -> np.ndarray:
         return np.array([c.frac_delay for c in self.channels], dtype=np.float64)
+
+    @property
+    def gains_tenths_db(self) -> tuple:
+        """Every channel's gain: its own record's when it has one (atkdaq
+        0.2.0+), else the fixed part's. They differ only when GAIN_SPLIT is
+        set; before atkdaq 0.2.0 they could not differ."""
+        return tuple(self.gain_tenths_db if c.gain_tenths_db is None else c.gain_tenths_db
+                     for c in self.channels)
 
     @property
     def session_ns(self) -> int:
@@ -274,7 +290,7 @@ def parse_header(buf) -> Header:
     hdr_bytes, ch_off, ch_stride = struct.unpack_from("<HHH", mv, 6)
     nch = mv[12]
     if not (1 <= nch <= MAX_CHANNELS) or ch_off < FIXED_BYTES \
-            or ch_stride < CH_STRIDE or hdr_bytes < ch_off + nch * ch_stride:
+            or ch_stride < CH_STRIDE_V1 or hdr_bytes < ch_off + nch * ch_stride:
         raise AtkqError(-5, f"inconsistent header sizes (hdr_bytes {hdr_bytes}, "
                             f"channels {nch} at {ch_off}+{ch_stride})")
     if len(mv) < hdr_bytes:
@@ -293,9 +309,12 @@ def parse_header(buf) -> Header:
         base = ch_off + i * ch_stride
         c = {name: struct.unpack_from("<" + code, mv, base + off)[0]
              for name, code, off in _CH_FIELDS}
+        g = (int(struct.unpack_from("<" + _CH_GAIN[1], mv, base + _CH_GAIN[2])[0])
+             if ch_stride >= _CH_GAIN[2] + 2 else None)
         chans.append(Channel(delay=int(c["delay"]), frac_delay=float(c["frac_delay"]),
                              weight=complex(c["w_re"], c["w_im"]), drops=int(c["drops"]),
-                             clip=int(c["clip"]), sample_count=int(c["sample_count"])))
+                             clip=int(c["clip"]), sample_count=int(c["sample_count"]),
+                             gain_tenths_db=g))
     if f["payload_bytes"] != nch * f["samples_per_ch"] * 2:
         raise AtkqError(-5, f"payload_bytes {f['payload_bytes']} is not "
                             f"{nch} × {f['samples_per_ch']} × 2")
@@ -338,6 +357,8 @@ def pack_header(h: Header) -> bytes:
         for (name, code, off), v in zip(_CH_FIELDS, (c.delay, c.frac_delay, w.real, w.imag,
                                                      c.drops, c.clip, c.sample_count)):
             struct.pack_into("<" + code, buf, base + off, v)
+        g = h.gain_tenths_db if c.gain_tenths_db is None else c.gain_tenths_db
+        struct.pack_into("<" + _CH_GAIN[1], buf, base + _CH_GAIN[2], int(g))
     struct.pack_into("<I", buf, 88, _crc(buf, total))
     return bytes(buf)
 

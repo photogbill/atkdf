@@ -165,3 +165,38 @@ def test_the_simulator_truth_matches_the_headers_it_writes():
     # the header's weights are the inverse of the planted receiver gains
     assert np.allclose(fr.header.weights, [complex(w) for w in truth["weights"]], atol=1e-3)
     assert np.allclose(fr.header.frac_delays, truth["frac"], atol=1e-3)
+
+
+def test_the_receivers_altitude_rides_on_every_record():
+    """2026-11-15: BearingRecord had `alt_m` and nothing filled it. An RWR on an
+    aircraft needs it (ATK's passive ranging: slant range from the receiver's
+    altitude); the engine now copies the positioning's altitude onto each record."""
+    from atkdf.ports import Fix2D
+
+    class HighSite:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def at(self, t):
+            f = self.inner.at(t)
+            return Fix2D(lat=f.lat, lon=f.lon, t_utc=f.t_utc, course_deg=f.course_deg,
+                         speed_mps=f.speed_mps, alt_m=3048.0, fix_age_s=f.fix_age_s,
+                         sigma_m=f.sigma_m, heading_deg=f.heading_deg,
+                         heading_sigma_deg=f.heading_sigma_deg)
+
+    sc = sim.Scenario(emitters=[sim.Emitter(bearing_deg=60.0, f0_hz=100_000.0, snr_db=20.0,
+                                            protocol="dmr", system="1", id="9", sync_type="ms")],
+                      seed=11)
+    s = sim.Simulator(sc, frames=6)
+    eng = engine.Engine(geometry=s.geometry, manifold=M.IdealManifold(s.geometry),
+                        positioning=HighSite(s.positioning),
+                        mode=engine.PlatformMode.static(), site_id="alpha")
+    by = {}
+    for e in s.events():
+        by.setdefault(e.n0, []).append(e)
+    recs = []
+    for fr in s.frames():
+        recs += eng.process(fr, events=by.get(fr.header.stream_sample0, []))
+    assert recs and all(r.alt_m == 3048.0 for r in recs)
+    from atkdf.records import BearingRecord
+    assert BearingRecord.from_json(recs[-1].to_json()).alt_m == 3048.0

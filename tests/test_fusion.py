@@ -679,3 +679,88 @@ def test_the_branch_choice_is_scored_without_the_shared_term_too():
     res, fix, note = fu.resolve_ambiguity(ambiguous_set(st, hdg))
     if fix is not None:
         assert fix.bound_axes, "the returned fix lost its error model"
+
+
+# ---------------------------------------------------------------------------
+# 10 — one platform's bearings: the thin crossing (2026-11-15, from ATK's
+# passive ranging — an RWR's DF array ranging a radar as it flies past)
+# ---------------------------------------------------------------------------
+
+THIN_START = (38.70, -77.58)
+
+
+def _thin_run(seed, sigma=4.0 / math.sqrt(10), bias=0.0, n=80, speed=150.0,
+              emitter_speed=0.0):
+    """One receiver flying east at `speed` m/s for 40 s, a line every 0.5 s, at an
+    emitter 5–30 km off to the north-east (moving west at `emitter_speed`)."""
+    r = np.random.default_rng(seed)
+    e0 = geo.direct(*THIN_START, float(r.uniform(10, 80)), float(r.uniform(5e3, 30e3)))
+    out = []
+    for k in range(n):
+        t = 0.5 * k + 0.25
+        la, lo = geo.direct(*THIN_START, 90.0, speed * t)
+        ela, elo = geo.direct(e0[0], e0[1], 270.0, emitter_speed * t)
+        b = geo.bearing_between(la, lo, ela, elo) + bias + r.normal(0, sigma)
+        out.append(geo.LOB(lat=la, lon=lo, bearing_deg=b % 360, sigma_deg=sigma,
+                           source="rx", epoch=1.7e9 + t))
+    return out, e0
+
+
+def _nis(fix, target):
+    e, n, _u = geo.geodetic_to_enu(target[0], target[1], 0.0, (fix.lat, fix.lon, 0.0))
+    v = np.array([float(e), float(n)])
+    return float(v @ np.linalg.solve(np.asarray(fix.cov, float).reshape(2, 2), v))
+
+
+def test_a_thin_crossing_reaches_the_ml_point_and_its_ellipse_means_it():
+    """The Jacobian is the PREDICTED bearing's normal (`_jacobian`). With the
+    measured bearing's normal — the pseudo-linear estimator's — one platform's
+    80 lines of 1.26° stopped up to 3 km from the maximum-likelihood point,
+    the stated 95 % ellipse held the truth 15 times in 40 and the mean
+    normalised error was 16 (2 is right). Measured with the fix: 37/40, 2.4."""
+    assert "_jacobian(pred, d)" in inspect.getsource(fu._solve)
+    assert "_jacobian(pred, d)" in inspect.getsource(fu._finish)
+    hits, nis = 0, []
+    for s in range(40):
+        lobs, tgt = _thin_run(1000 + s)
+        f = fu.ml_fix(lobs, systematic_deg=0.0)
+        nis.append(_nis(f, tgt))
+        a, b, ang = f.ellipse(0.95)
+        e, n, _u = geo.geodetic_to_enu(tgt[0], tgt[1], 0.0, (f.lat, f.lon, 0.0))
+        u = np.array([math.sin(math.radians(ang)), math.cos(math.radians(ang))])
+        w = np.array([u[1], -u[0]])
+        v = np.array([float(e), float(n)])
+        hits += (v @ u / a) ** 2 + (v @ w / b) ** 2 <= 1.0
+    assert hits >= 34, f"95 % ellipse held the truth {hits}/40"
+    assert np.mean(nis) < 3.5, f"mean normalised error {np.mean(nis):.1f} (2 expected)"
+
+
+def test_a_shared_bias_inside_its_bound_is_not_called_inconsistent():
+    """χ² is taken against the model the fit used (the shared term included).
+    Diagonal-only, a ±3° bound on one platform's run called 11/60 clean sets
+    and 27/60 with a 2° bias (inside the bound) 'inconsistent'."""
+    bad = sum(not fu.ml_fix(_thin_run(2000 + s, sigma=0.5, bias=b)[0],
+                            bias_bound_deg=3.0).consistent
+              for s in range(15) for b in (0.0, 2.0))
+    assert bad <= 1, f"{bad}/30 consistent sets called inconsistent"
+
+
+def test_a_moving_emitter_is_still_caught_under_a_bias_bound():
+    """...and a radar that MOVES is not a common rotation: still not one point.
+    The receiver turns north half way (a straight run against a constant-velocity
+    target is the classic unobservable case and proves nothing)."""
+    r = np.random.default_rng(5)
+    e0 = geo.direct(*THIN_START, 45.0, 12_000.0)
+    lobs = []
+    for k in range(120):
+        t = 0.5 * k
+        if t < 30:
+            la, lo = geo.direct(*THIN_START, 90.0, 200.0 * t)
+        else:
+            p1 = geo.direct(*THIN_START, 90.0, 6000.0)
+            la, lo = geo.direct(p1[0], p1[1], 0.0, 200.0 * (t - 30))
+        ela, elo = geo.direct(e0[0], e0[1], 270.0, 40.0 * t)
+        b = geo.bearing_between(la, lo, ela, elo) + r.normal(0, 0.5)
+        lobs.append(geo.LOB(lat=la, lon=lo, bearing_deg=b % 360, sigma_deg=0.5,
+                            source="rx", epoch=1.7e9 + t))
+    assert not fu.ml_fix(lobs, bias_bound_deg=3.0).consistent

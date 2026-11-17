@@ -319,6 +319,18 @@ provides `FileSource` and `ProcessSource` (starts `atkdaq.exe`, reads stdout,
 parses stderr status, sends stdin commands). `tests/test_atkq.py` holds it to a
 fixture atkdaq itself wrote.
 
+**2026-11-16, atkdaq 0.2.0 (per-channel gain, asked for by passive radar):**
+each channel record grew from 32 to 40 bytes and carries its own read-back
+gain (`int16` at offset 32); the fixed-part gain is channel 0's and the flag
+`GAIN_SPLIT` (bit 9) says the channels differ. Still wire version 1. The
+reader accepts any stride ≥ 32, so it reads both; `Channel.gain_tenths_db`
+is `None` for a 32-byte record, and `Header.gains_tenths_db` falls back to
+the fixed part. A second fixture (`synth_gainsplit_v020.atkq`, three
+channels at 19.7/32.8/32.8 dB) holds it to what atkdaq 0.2.0 wrote. DF
+itself is unaffected: calibration still runs at one gain; a split gain
+changes each channel's phase, so a calibration cache must key on the whole
+gain vector (CUED_DF_PLAN §4).
+
 ### 11.3 The manifold and the array frame (`manifold.py`)
 
 The array frame is fixed once: x forward (toward element 0), y left, θ
@@ -983,3 +995,96 @@ The SigMF `spatial` recording reader/writer (§11.4.6 wire formats) is still
 to do, with the UHD `multi_usrp` `FrameSource`, DIFI import and the measured
 tables, in step 6. No hardware has been touched; every number above is
 simulation.
+
+## 18. Build notes — 2026-11-15: two fixes to `fusion.ml_fix`, found by ATK's passive ranging
+
+ATK's RWR gained passive ranging (ATK `docs/RADAR_RWR_PLAN.md` §13): the DF
+array's bearings to a radar, taken from a MOVING receiver, fixed with
+`ml_fix`. One platform's run is the thinnest geometry `ml_fix` is ever given
+(the lines swing through 10–30°, all from one side), and coverage testing on
+it found two faults that wide multi-site crossings had hidden. Both are
+fixed; the tests are `tests/test_fusion.py` §10, and both fail on the old code.
+
+* **The Jacobian was the pseudo-linear estimator's.** `_solve` and `_finish`
+  used each bearing's MEASURED normal (`_setup`'s `nrm`) where ∂θ/∂x is the
+  PREDICTED bearing's normal over the range. The fixed point of that
+  iteration is not the maximum-likelihood point: each line's noise tilts its
+  normal, and on a thin crossing the tilts pull the answer along the line of
+  sight. Measured, one receiver 6 km past emitters 5–30 km off, 80 lines of
+  1.26°: fixes up to 3 km from the ML point (an independent solver agreed
+  with the new answer to metres), the 95 % ellipse holding the truth 15/40,
+  mean normalised error 16 (2 is right). Now: `_jacobian(pred, d)` in both,
+  with a backtracking line search (a full Gauss-Newton step on a thin
+  crossing can overshoot along the line of sight); 37/40, 2.4. Multi-site
+  results barely move.
+* **The consistency χ² ignored the model the fit used.** With a shared bias
+  (any `bias_bound_deg`, and atkdf's default) the answer comes from
+  R = D + σ_sys²·groups, but χ² was taken diagonal-only, so the common
+  rotation the fit had allowed counted as misfit: on one platform's run with
+  a ±3° bound, 11/60 clean sets and 27/60 with a 2° bias inside the bound
+  came back "inconsistent". Now χ² = rᵀR⁻¹r with the fit's own R (identical
+  to before when there is no shared term). A moving emitter — not a common
+  rotation — is still caught (test).
+
+* **The receiver's altitude now rides on every bearing record.** `BearingRecord`
+  had `alt_m` and the engine never filled it; it now copies the positioning's
+  `Fix2D.alt_m` (None where the positioning has none). ATK's RWR needs it for
+  slant range from an aircraft (ATK RADAR_RWR_PLAN §13.7). Test:
+  `test_engine_sim.py::test_the_receivers_altitude_rides_on_every_record`.
+
+The atkdf suite: 498 → 502 tests, all green.
+
+---
+
+## 19. Build notes — 2026-11-16: terrain in the posterior, the road filter, a shared bias
+
+The propagation build plan's §6.1 hand-off, now that ATK's terrain engine
+(atkprop) is real behind the `LossField` port.
+
+* **The shadow likelihood** (`posterior.Posterior.terrain_update`, umbrella
+  §8.6). Heard from here, so ground from which a radio of its class could not
+  have been heard is less likely: P(heard) = EIRP (uniform over the class's
+  range) − field loss clears the sensitivity (−174 + 10·log B + NF + SNR −
+  G + L), with 8 dB location shadowing widened by the terrain's post spacing.
+  Classes by path tag (`direct` → handheld or mobile; `unknown` adds a base
+  on a 30 m mast), each with its own transmit height. Down-weighted, never
+  zeroed (floor 0.02). **Once per place heard from** (a new place is ≥ 250 m
+  from the last), and **joint over places with ONE EIRP** — heard from three
+  places, a weak handheld cleared the sensitivity three times; counting its
+  unknown power three times would over-state it (test). Needs no calibrated
+  received level, so it comes before the range likelihood (§8.7), which waits
+  for the level offset from reference emitters.
+* **Judged by containment, not shrinkage** (the plan's rule). 160 simulated
+  emitters heard by the same model the likelihood assumes, two receivers,
+  each walled off by 60 dB in one sector: the 90/95 % region held the truth
+  157/160 with and without terrain (Clopper–Pearson brackets the stated rate),
+  and the mean region shrank 22 % (3.20 → 2.48 km²). `region`,
+  `region_area_m2`, `contains`, `region_outline` (rings for a map), public
+  `trace_rings`, `coverage_interval`.
+* **A shared bearing bias** (`Posterior(spec, bias_bound_deg=3)`). Every
+  bearing from one array has the same alignment error; the plain product of
+  likelihoods treats them as independent and shrinks the region past the
+  truth. Seven bias hypotheses over ±bound (rectangular, as fusion assumes),
+  each applied to every bearing, mixed. 60 emitters, 21 bearings from one
+  array with a bias drawn in ±3°: independent product under-covers (< 80 %
+  at 90 %); with the bias carried, the stated 90 % holds (CP interval).
+* **The road-constrained particle filter** (`roadfilter.RoadParticleFilter`,
+  umbrella §8.5). Particles on directed road segments with a speed;
+  predict along the road (random onward turn, dead ends stop), weight by the
+  full bearing likelihood, systematic resampling; seed from a grid
+  posterior's belief or an area, snapped to roads; `candidates()` groups the
+  belief by road — a bearing across three roads is three candidates (test).
+  Two parked receivers following a car that turns a corner: on its street,
+  mean error ~270 m against ~710 m for the free grid ageing at vehicle speed.
+  **Honest limit, pinned by a test:** one receiver that does not move cannot
+  range a car on a straight road (a car twice as far driving twice as fast
+  draws the same bearings) — the filter keeps several candidates and says so.
+* `fakes.GridRoads`: an eleven-by-eleven street grid behind the `RoadGraph`
+  port, for tests.
+
+ATK's side (same day): `atk\core\df_search.py` — the terrain-aware search
+area per fix on the Geospatial map (teal; amber-orange from bearings alone),
+dead ground from the array, and "where to drive" (atkprop `rank_vantages`
+weighted by the posterior) — with a checkbox and a button on the DF tab.
+
+The atkdf suite: 502 → 518 tests.

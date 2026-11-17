@@ -708,6 +708,10 @@ class Engine:
             heading_deg=heading, heading_sigma_deg=heading_sig, theta_abs_deg=theta_abs,
             quality=quality, likelihood=res.likelihood,
             lat=(fix.lat if fix else None), lon=(fix.lon if fix else None),
+            # the receiver's altitude when the positioning knows it (2026-11-15:
+            # the record had the field and nothing filled it — an RWR on an
+            # aircraft needs it for slant range; ATK RADAR_RWR_PLAN §13)
+            alt_m=(getattr(fix, "alt_m", None) if fix else None),
             fix_age_s=(fix.fix_age_s if fix else None),
             platform_mode=self.mode.name, site_id=self.site_id,
             passport_uid=(passport_uid if passport_uid is not None

@@ -6,3 +6,4 @@ build/
 dist/
 *.atkq
 !tests/fixtures/*.atkq
+.git-commit-message.txt

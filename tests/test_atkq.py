@@ -29,6 +29,9 @@ def test_the_documented_offsets_are_what_the_reader_uses():
     assert off["seg_sample0"] == 80 and off["hdr_crc32"] == 88
     ch = {name: o for name, _c, o in atkq._CH_FIELDS}
     assert ch["sample_count"] == 24 and ch["frac_delay"] == 4
+    assert atkq._CH_GAIN == ("gain_tenths_db", "h", 32)       # appended 2026-11-16
+    assert atkq.CH_STRIDE == 40 and atkq.CH_STRIDE_V1 == 32
+    assert atkq.Flag.GAIN_SPLIT == 1 << 9
 
 
 def test_pack_then_parse_round_trips():
@@ -41,7 +44,7 @@ def test_pack_then_parse_round_trips():
                     device_kind=2, segment=3, passport=9, stream_sample0=987654321,
                     gain_tenths_db=280)
     raw = atkq.pack_header(h)
-    assert len(raw) == 96 + 5 * 32
+    assert len(raw) == 96 + 5 * 40
     h2 = atkq.parse_header(raw)
     assert (h2.seq, h2.t_utc_ns, h2.fc_hz, h2.stream_sample0) == \
         (77, 1790000000123456789, 446_000_000, 987654321)
@@ -154,3 +157,44 @@ def test_the_file_source_replays_the_fixture():
     assert n == 20
     src.control("tune 450e6")           # a file has nothing to tune, but records it
     assert src.commands == ["tune 450e6"]
+
+
+def test_per_channel_gain_round_trips_and_old_records_still_read():
+    """atkdaq 0.2.0 (2026-11-16) appended each channel's gain to its record
+    (32 -> 40 bytes, still version 1). New headers carry it; the fixture
+    atkdaq wrote BEFORE then has 32-byte records and must read as it always
+    did, every channel at the fixed part's gain."""
+    chans = tuple(atkq.Channel(0, 0.0, 1 + 0j, gain_tenths_db=(197 if i == 0 else 328))
+                  for i in range(5))
+    h = atkq.Header(n_channels=5, fs_hz=2_400_000, samples_per_ch=100, channels=chans,
+                    gain_tenths_db=197, flags=int(atkq.Flag.GAIN_SPLIT))
+    h2 = atkq.parse_header(atkq.pack_header(h))
+    assert h2.gains_tenths_db == (197, 328, 328, 328, 328)
+    assert h2.has(atkq.Flag.GAIN_SPLIT) and h2.gain_tenths_db == 197
+    # a Channel without its own gain is written at the header's
+    plain = atkq.Header(n_channels=2, fs_hz=2_400_000, samples_per_ch=10, gain_tenths_db=280,
+                        channels=(atkq.Channel(0, 0, 1 + 0j),) * 2)
+    assert atkq.parse_header(atkq.pack_header(plain)).gains_tenths_db == (280, 280)
+    if FIXTURE.is_file():
+        with FIXTURE.open("rb") as f:
+            fr = next(atkq.read_frames(f))
+        assert fr.header.channels[0].gain_tenths_db is None          # a 32-byte record
+        assert fr.header.gains_tenths_db == (fr.header.gain_tenths_db,) * fr.header.n_channels
+
+
+def test_reads_what_atkdaq_0_2_0_wrote_with_split_gains():
+    """`tests/fixtures/synth_gainsplit_v020.atkq` was written by atkdaq 0.2.0
+    itself (synthetic device, 3 channels, `--gains 197,328,328`). Its 40-byte
+    channel records are atkdaq's writer; this module is the independent
+    reader; they must agree on every channel's gain."""
+    p = FIXTURES / "synth_gainsplit_v020.atkq"
+    with p.open("rb") as f:
+        frames = list(atkq.read_frames(f))
+    assert len(frames) == 4
+    for fr in frames:
+        h = fr.header
+        assert h.hdr_bytes == 96 + 3 * 40
+        assert h.gains_tenths_db == (197, 328, 328)
+        assert h.has(atkq.Flag.GAIN_SPLIT) and h.has(atkq.Flag.SYNTHETIC)
+        assert h.gain_tenths_db == 197                    # the fixed part: channel 0's
+        assert fr.iq().shape == (3, h.samples_per_ch)

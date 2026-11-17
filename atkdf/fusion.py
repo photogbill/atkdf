@@ -788,6 +788,28 @@ def stansfield(lobs, ref=None, systematic_deg=None,
                    *resolve_systematic(systematic_deg, bias_bound_deg))
 
 
+def _jacobian(pred_deg, d) -> np.ndarray:
+    """∂θ/∂x: the left normal of the PREDICTED bearing (station → estimate) over the
+    range. One metre sideways at range d turns the bearing by 1/d radians.
+
+    **THE NORMAL IS THE PREDICTED BEARING'S, NOT THE MEASURED ONE'S.** Up to
+    2026-11-15 this used the measured bearings' normals (`_setup`'s `nrm`).
+    That is the pseudo-linear estimator's Jacobian, and its fixed point is not
+    the maximum-likelihood point: each line's own noise tilts its normal, and
+    on a weak crossing — one platform's bearings swinging through 10–30° —
+    the tilts do not average out, they pull the answer ALONG the line of
+    sight. Measured (ATK's passive-ranging tests, one receiver flying 6 km
+    past emitters 5–30 km off, 80 lines of 1.26°): the fix stopped up to
+    3 km from the ML point, and the stated 95 % ellipse held the truth 15 of
+    40 times; mean normalised error 16 where 2 is right. With the predicted
+    normal: the ML point (checked against an independent solver), and the
+    ellipse means what it says. Wide multi-site crossings were barely
+    affected — the tilt matters only when the geometry is thin. The
+    covariance (`_finish`) uses the same Jacobian, at the answer."""
+    t = np.radians(np.asarray(pred_deg, dtype=float))
+    return np.stack([np.cos(t), -np.sin(t)], axis=1) / np.asarray(d, dtype=float)[:, None]
+
+
 def _solve(lobs, ref, p, nrm, sys_sigma: float, max_iter: int) -> np.ndarray:
     """Gauss-Newton in angle space. The position only — `_finish` does the rest.
 
@@ -808,9 +830,9 @@ def _solve(lobs, ref, p, nrm, sys_sigma: float, max_iter: int) -> np.ndarray:
         # position uncertainty becomes an ANGULAR one only at a range, and
         # the range is what is being solved for.
         r_inv = np.linalg.pinv(measurement_covariance(lobs, sys_sigma, d))
-        # ∂θ/∂p is the left normal over the range: one metre sideways at
-        # range d turns the bearing by 1/d radians
-        jac = nrm / d[:, None]
+        # ∂θ/∂p is the left normal of the PREDICTED bearing over the range
+        # (see `_jacobian` — the measured bearing's normal biased weak fixes)
+        jac = _jacobian(pred, d)
         h = jac.T @ r_inv @ jac
         g = jac.T @ r_inv @ resid
         try:
@@ -824,6 +846,22 @@ def _solve(lobs, ref, p, nrm, sys_sigma: float, max_iter: int) -> np.ndarray:
         # of kilometres away with an ellipse to match, which at least is
         # obvious. A sign error that merely halved the step would have been
         # far harder to see.
+        #
+        # BACKTRACKED. With the exact Jacobian (`_jacobian`) a full Gauss-Newton
+        # step on a thin crossing can overshoot along the line of sight — past
+        # the emitter, or back behind the receivers. A step is halved until the
+        # weighted misfit no longer grows; on any well-posed geometry the full
+        # step is taken first time and this costs one extra prediction.
+        cost = float(resid @ r_inv @ resid)
+        for _half in range(12):
+            x_new = x + step
+            d_new = np.maximum(np.linalg.norm(x_new[None, :] - p, axis=1), 1.0)
+            r_new = np.radians(geo.angle_difference(
+                [l.bearing_deg for l in lobs], _predicted(lobs, ref, x_new)))
+            r_inv_new = np.linalg.pinv(measurement_covariance(lobs, sys_sigma, d_new))
+            if float(r_new @ r_inv_new @ r_new) <= cost * (1.0 + 1e-9) + 1e-18:
+                break
+            step = 0.5 * step
         x = x + step
         if float(np.linalg.norm(step)) < 1e-4:
             break
@@ -923,7 +961,7 @@ def _finish(lobs, ref, p, nrm, x, method, systematic_deg,
     d = np.maximum(np.linalg.norm(delta, axis=1), 1.0)
     pred = _predicted(lobs, ref, x)
     resid_deg = geo.angle_difference([l.bearing_deg for l in lobs], pred)
-    jac = nrm / d[:, None]
+    jac = _jacobian(pred, d)
 
     # THE COVARIANCE IS DECOMPOSED, NOT INVERTED IN ONE PIECE.
     #
@@ -1014,7 +1052,27 @@ def _finish(lobs, ref, p, nrm, x, method, systematic_deg,
         gdop = float("nan")
 
     dof = max(1, n - 2)
-    chi2 = float(np.sum((resid_deg / sig_deg) ** 2))
+    # THE CONSISTENCY TEST USES THE MODEL THE FIT USED. With a shared bias in
+    # play the answer comes from R = D + σ_sys²·(groups), which lets every
+    # bearing of a group turn together; the leftover residuals then carry a
+    # common rotation that the diagonal-only χ² counts as misfit. Up to
+    # 2026-11-15 the test was diagonal-only, and on one platform's bearings
+    # (ATK's passive ranging: 80 lines over a 6 km run, a ±3° bound) it called
+    # 11 of 60 perfectly consistent sets — one fixed emitter, NO bias —
+    # "inconsistent", and 27 of 60 when a 2° bias (inside the bound) was
+    # real. Against the full R a bias inside the model is explained, as it
+    # should be, while a second emitter or a moving one still is not (its
+    # misfit is not a common rotation). With no shared term this is exactly
+    # the old diagonal sum.
+    if systematic_deg and systematic_deg > 0 and n > 2:
+        r_rad = np.radians(np.asarray(resid_deg, dtype=float))
+        try:
+            chi2 = float(r_rad @ np.linalg.pinv(
+                measurement_covariance(lobs, systematic_deg, d)) @ r_rad)
+        except (np.linalg.LinAlgError, ValueError):
+            chi2 = float(np.sum((resid_deg / sig_deg) ** 2))
+    else:
+        chi2 = float(np.sum((resid_deg / sig_deg) ** 2))
     p_val = chi2_sf(chi2, dof) if n > 2 else float("nan")
 
     lat, lon, _alt = geo.enu_to_geodetic(float(x[0]), float(x[1]), 0.0, ref)

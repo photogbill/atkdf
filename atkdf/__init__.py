@@ -32,6 +32,9 @@ from . import bandplan, integrate, pilots
 # configuration and estimators; no new hardware dependency.
 from . import architectures, arrayprofile, caltables, doa2d, health, timing
 from . import channel_grid
+# 2026-11-16: the road-constrained particle filter (umbrella §8.5); the shadow
+# likelihood itself lives in posterior (terrain_update)
+from . import roadfilter
 from .dossier import Measurement
 from .engine import Engine, PlatformMode
 from .heading import HeadingFilter
@@ -53,7 +56,7 @@ __all__ = [
     "Registry", "HeadingFilter", "FixedSite", "site",
     "atkq", "calibration", "doa", "manifold", "records", "registry", "recorder",
     "heading", "identity", "motion", "posterior", "references", "roster", "scheduler",
-    "tracker", "exports", "bandplan", "integrate", "pilots",
+    "tracker", "exports", "bandplan", "integrate", "pilots", "roadfilter",
     "ports", "fakes", "sim", "recio", "geodesy",
     "ephemeris", "fusion", "geoloc", "df_file", "dossier", "bluefile",
 ]

@@ -192,6 +192,79 @@ class NoRoads:
         return distance_between(a[0], a[1], b[0], b[1]) / 13.4    # ~30 mph
 
 
+class GridRoads:
+    """A `RoadGraph` of straight two-way streets on a square grid: `n` x `n`
+    junctions `spacing_m` apart, the south-west one at (lat0, lon0). Edges are
+    DIRECTED (``h<row>_<col>`` east, ``h<row>_<col>r`` west, ``v…`` north and
+    ``v…r`` south), as ATK's road adapter makes them — the tests' stand-in for
+    a town, so the road-constrained filter is tested without a map."""
+
+    def __init__(self, lat0: float, lon0: float, spacing_m: float = 1000.0, n: int = 11,
+                 max_snap_m: float = 400.0):
+        self.ref = (float(lat0), float(lon0), 0.0)
+        self.s = float(spacing_m)
+        self.n = int(n)
+        self.max_snap_m = float(max_snap_m)
+
+    def _ll(self, r: int, c: int) -> tuple:
+        from .geodesy import enu_to_geodetic
+        la, lo, _ = enu_to_geodetic(c * self.s, r * self.s, 0.0, self.ref)
+        return (float(la), float(lo))
+
+    def _edge(self, kind: str, r: int, c: int, rev: bool):
+        from .ports import Edge
+        if kind == "h":                       # junction (r, c) -> (r, c+1)
+            a, b = self._ll(r, c), self._ll(r, c + 1)
+        else:                                 # junction (r, c) -> (r+1, c)
+            a, b = self._ll(r, c), self._ll(r + 1, c)
+        if rev:
+            a, b = b, a
+        return Edge(id=f"{kind}{r}_{c}{'r' if rev else ''}", a=a, b=b, length_m=self.s)
+
+    def nearest_edge(self, lat, lon):
+        from .geodesy import geodetic_to_enu
+        e, nn, _ = geodetic_to_enu(lat, lon, 0.0, self.ref)
+        e, nn = float(e), float(nn)
+        top = (self.n - 1) * self.s
+        if not (-self.max_snap_m <= e <= top + self.max_snap_m
+                and -self.max_snap_m <= nn <= top + self.max_snap_m):
+            return None
+        r = int(min(max(round(nn / self.s), 0), self.n - 1))
+        c = int(min(max(round(e / self.s), 0), self.n - 1))
+        ch = int(min(max(math.floor(e / self.s), 0), self.n - 2))
+        rv = int(min(max(math.floor(nn / self.s), 0), self.n - 2))
+        dh = abs(nn - r * self.s) + max(0.0, -e) + max(0.0, e - top)
+        dv = abs(e - c * self.s) + max(0.0, -nn) + max(0.0, nn - top)
+        if min(dh, dv) > self.max_snap_m:
+            return None
+        return self._edge("h", r, ch, False) if dh <= dv else self._edge("v", rv, c, False)
+
+    def neighbours(self, edge) -> list:
+        text = str(edge.id)
+        rev = text.endswith("r")
+        kind, rest = text[0], text[1:].rstrip("r")
+        r, c = (int(x) for x in rest.split("_"))
+        # the junction we LEAVE the edge at
+        if kind == "h":
+            jr, jc = (r, c) if rev else (r, c + 1)
+        else:
+            jr, jc = (r, c) if rev else (r + 1, c)
+        out = []
+        if jc + 1 <= self.n - 1:
+            out.append(self._edge("h", jr, jc, False))
+        if jc - 1 >= 0:
+            out.append(self._edge("h", jr, jc - 1, True))
+        if jr + 1 <= self.n - 1:
+            out.append(self._edge("v", jr, jc, False))
+        if jr - 1 >= 0:
+            out.append(self._edge("v", jr - 1, jc, True))
+        back = text[:-1] if rev else text + "r"
+        return [e for e in out if e.id != back]       # no U-turn
+
+    def route_time_s(self, a, b):
+        return distance_between(a[0], a[1], b[0], b[1]) * 1.3 / 13.4
+
+
 class ListEvents:
     """A fixed list of BurstEvents, replayed in time order."""
 
